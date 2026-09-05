@@ -797,15 +797,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not user_name:
                     user_name = str(getattr(sender_chat, "title", "") or "").strip() or None
         chat_id = str(getattr(chat, "id", "")).strip() or user_id
-        thread_id_raw = getattr(message, "message_thread_id", None)
         is_topic_message = bool(getattr(message, "is_topic_message", False))
         is_forum_group = getattr(chat, "is_forum", False) is True
+        thread_id = self._effective_message_thread_id(message)
         chat_type = self._normalize_chat_type(
-            getattr(chat, "type", "dm"), is_forum=thread_id_raw is not None and (is_topic_message or is_forum_group))
-        thread_id = None
-        if thread_id_raw is not None and (
-            (chat_type == "forum" and (is_topic_message or is_forum_group)) or (chat_type == "dm" and is_topic_message)):
-            thread_id = str(thread_id_raw)
+            getattr(chat, "type", "dm"),
+            is_forum=is_forum_group or (thread_id is not None and is_topic_message),
+        )
         source_kwargs = dict(
             chat_id=chat_id or "", chat_type=chat_type, user_id=user_id,
             user_name=user_name, thread_id=thread_id, is_bot=is_bot,
@@ -5767,7 +5765,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         source = self._source_from_location_message(msg)
         if not self._is_strictly_authorized_source(source):
-            self._log_blocked_user(msg)
+            logger.warning(
+                "[Telegram] Rejected location telemetry from unauthorized source"
+            )
             return
         # Preserve group/topic trigger and observation gates without writing an observed transcript.
         if not (

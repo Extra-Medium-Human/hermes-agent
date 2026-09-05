@@ -94,18 +94,24 @@ def _prepare_profile(home: Path, profile: str) -> None:
     (home / "profiles" / profile).mkdir(parents=True)
 
 
-def test_unknown_sender_cannot_write_or_dispatch_location(tmp_path, monkeypatch):
+def test_unknown_sender_cannot_write_dispatch_or_log_location_identity(
+    tmp_path, monkeypatch, caplog
+):
     """Changing strict auth to the pairing-friendly prefilter must fail this test."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _adapter(authorized=False)
 
-    asyncio.run(adapter._handle_location_message(_location_update(), None))
+    with caplog.at_level("WARNING"):
+        asyncio.run(adapter._handle_location_message(_location_update(), None))
 
     assert not _snapshot_path(tmp_path).exists()
     adapter._message_handler.assert_not_awaited()
     adapter.send.assert_not_awaited()
     assert adapter._active_sessions == {}
     assert adapter._pending_messages == {}
+    assert "Rejected location telemetry from unauthorized source" in caplog.text
+    assert "user 202" not in caplog.text
+    assert "chat 101" not in caplog.text
 
 
 def test_routed_location_writes_only_routed_profile(tmp_path, monkeypatch, caplog):
@@ -138,6 +144,30 @@ def test_routed_location_writes_only_routed_profile(tmp_path, monkeypatch, caplo
     adapter.send.assert_not_awaited()
     assert "0.125" not in caplog.text
     assert "-0.25" not in caplog.text
+
+
+def test_forum_general_location_uses_canonical_thread_profile_route(
+    tmp_path, monkeypatch
+):
+    """General-topic routing must use the same synthetic thread id as group gating."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter(authorized=True, extra={"require_mention": False})
+    _prepare_profile(tmp_path, "general-profile")
+    adapter.gateway_runner = SimpleNamespace(
+        _profile_name_for_source=lambda source: (
+            "general-profile" if source.thread_id == "1" else None
+        )
+    )
+
+    asyncio.run(
+        adapter._handle_location_message(
+            _location_update(chat_type="supergroup", thread_id=None), None
+        )
+    )
+
+    assert _snapshot_path(tmp_path, "general-profile").exists()
+    assert not _snapshot_path(tmp_path).exists()
+    adapter._message_handler.assert_not_awaited()
 
 
 def test_rejected_profile_route_fails_closed(tmp_path, monkeypatch):
