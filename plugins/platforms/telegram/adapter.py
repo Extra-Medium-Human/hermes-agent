@@ -784,6 +784,8 @@ class TelegramAdapter(BasePlatformAdapter):
     ):
         """Build the SessionSource the gateway auth path expects; identity comes from ``from_user``,
         falling back to ``sender_chat`` for channel posts so an unauthorized channel can't inject."""
+        from gateway.session import SessionSource
+
         user = getattr(message, "from_user", None)
         chat = getattr(message, "chat", None)
         user_id = str(getattr(user, "id", "")).strip() or None
@@ -797,19 +799,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not user_name:
                     user_name = str(getattr(sender_chat, "title", "") or "").strip() or None
         chat_id = str(getattr(chat, "id", "")).strip() or user_id
+        thread_id_raw = getattr(message, "message_thread_id", None)
         is_topic_message = bool(getattr(message, "is_topic_message", False))
         is_forum_group = getattr(chat, "is_forum", False) is True
-        thread_id = self._effective_message_thread_id(message)
+        thread_id = self._effective_message_thread_id(message) if fail_closed_profile_resolution else None
         chat_type = self._normalize_chat_type(
             getattr(chat, "type", "dm"),
-            is_forum=is_forum_group or (thread_id is not None and is_topic_message),
+            is_forum=(is_forum_group or (thread_id is not None and is_topic_message))
+            if fail_closed_profile_resolution
+            else thread_id_raw is not None and (is_topic_message or is_forum_group),
         )
+        if not fail_closed_profile_resolution:
+            if thread_id_raw is not None and (
+                (chat_type == "forum" and (is_topic_message or is_forum_group))
+                or (chat_type == "dm" and is_topic_message)
+            ):
+                thread_id = str(thread_id_raw)
+            return SessionSource(
+                platform=Platform.TELEGRAM, chat_id=chat_id or "", chat_type=chat_type,
+                user_id=user_id, user_name=user_name, thread_id=thread_id, is_bot=is_bot)
+
         source_kwargs = dict(
             chat_id=chat_id or "", chat_type=chat_type, user_id=user_id,
             user_name=user_name, thread_id=thread_id, is_bot=is_bot,
             message_id=getattr(message, "message_id", None))
-        if fail_closed_profile_resolution:
-            source_kwargs["fail_closed_profile_resolution"] = True
+        source_kwargs["fail_closed_profile_resolution"] = True
         return self.build_source(**source_kwargs)
 
     def _is_strictly_authorized_source(self, source) -> bool:
