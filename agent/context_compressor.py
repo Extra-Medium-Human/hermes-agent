@@ -4214,18 +4214,35 @@ Write only the summary body. Do not include any preamble or prefix."""
         if cut_idx <= head_end:
             cut_idx = max(fallback_cut, head_end + 1)
         cut_idx = self._align_boundary_backward(messages, cut_idx)
-        # Latest user message must stay in the tail (active task). Latest assistant reply must stay too;
-        # anchors only walk backward, so chaining is monotonic.
-        # Ensure the most recent user message is always in the tail so the active task is never lost to
-        # compression (fixes #10896).
-        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
-        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+        # Completed exchanges and short tool runs keep the latest user and visible assistant reply verbatim.
+        # In a long unfinished tool loop those anchors retain the ENTIRE active turn, making every compression a
+        # no-op after a restart or prior handoff. The finalizer already re-appends the exact in-flight task after
+        # the summary; the ordinary token walk and tool-group alignment keep the newest working set structurally
+        # intact. Letting the cut cross only the older part of a long human turn makes sustained coding
+        # compressible without changing short-turn UI continuity or treating synthetic event rows as tasks.
+        inflight_task = self._find_inflight_user_task(messages)
+        inflight_task_idx = next(
+            (i for i, message in enumerate(messages) if message is inflight_task), -1
+        )
+        inflight_tool_rounds = sum(
+            1
+            for message in messages[inflight_task_idx + 1:]
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        )
+        long_human_tool_loop = (
+            inflight_task_idx >= 0
+            and not _synthetic_user_row(_content_text_for_contains(inflight_task.get("content")))
+            and inflight_tool_rounds > _LEAN_TAIL_KEEP_TOOL_ROUNDS
+        )
+        if not long_human_tool_loop:
+            cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+            cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
 
-        # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
-        # the assistant anchor could re-trigger its forward turn-pair push. getattr: __new__ doubles skip __init__.
-        _min_tail_users = getattr(self, "min_tail_user_messages", 1)
-        if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
-            cut_idx = self._ensure_last_n_user_messages_in_tail(messages, cut_idx, head_end, _min_tail_users)
+            # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
+            # the assistant anchor could re-trigger its forward turn-pair push. getattr: __new__ doubles skip __init__.
+            _min_tail_users = getattr(self, "min_tail_user_messages", 1)
+            if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
+                cut_idx = self._ensure_last_n_user_messages_in_tail(messages, cut_idx, head_end, _min_tail_users)
 
         # Floor guarantees progress (>= 1 message claimed); re-align FORWARD only so a raised cut
         # can't split a tool group (backward would give the floor's message back).
