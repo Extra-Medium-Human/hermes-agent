@@ -787,10 +787,12 @@ def _synthetic_user_row(content: str) -> bool:
 
 def _build_verbatim_user_section(turns: List[Dict[str, Any]]) -> str:
     """Compacted region's REAL user messages verbatim, newest-first under a char budget (straddler truncated); "" if none."""
+    from agent.conversation_compression import _is_real_user_message
+
     collected: list[str] = []
     used = 0
     for msg in reversed(turns):
-        if msg.get("role") != "user":
+        if not _is_real_user_message(msg):
             continue
         content = _content_text_for_contains(msg.get("content"))
         if _synthetic_user_row(content):
@@ -3564,12 +3566,15 @@ Write only the summary body. Do not include any preamble or prefix."""
 
     @classmethod
     def _is_synthetic_compression_user_turn(cls, message: Any) -> bool:
-        """Recognize internal user-role rows by content marker (SessionDB drops metadata)."""
+        """Recognize operational rows by durable provenance, with markers for older transcripts."""
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
-        if cls._is_context_summary_message(message):
+        if message.get("display_kind") or cls._is_context_summary_message(message):
             return True
         text = _content_text_for_contains(message.get("content")).strip()
+        from agent.replay_cleanup import is_auto_continue_noise, strip_auto_continue_noise
+        if is_auto_continue_noise(text) and not strip_auto_continue_noise(text):
+            return True
         # Recovery nudges are scaffolding, not human turns; lazy import avoids an import cycle.
         from agent.conversation_loop import (
             _CODEX_ACK_CONTINUATION_NUDGE, _CODEX_INCOMPLETE_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,

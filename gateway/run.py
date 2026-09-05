@@ -977,16 +977,13 @@ def build_resume_recovery_note(
         else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
     if message:
         resume_guidance = (
-            "Address the user's NEW message below FIRST and focus on what the user is asking now.")
+            "Address the user's NEW message below FIRST and focus on what the user is asking now. "
+            "If it explicitly asks to resume or finish the interrupted task, continue that task from "
+            "the next unfinished step using the recorded results. Status or reporting requests must report from "
+            "recorded history without resuming work. Otherwise do not revive unrelated unfinished work.")
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
-        )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+            "Do NOT repeat successful tool calls merely to recreate completed work. "
+            "A failed or incomplete result may require a retry after checking the cause and current state."
         )
     else:
         resume_guidance = (
@@ -995,13 +992,17 @@ def build_resume_recovery_note(
             "or ask questions. Review the conversation history and "
             "CONTINUE the interrupted task to completion.")
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step that has no recorded result.")
+            "Use recorded results to identify the next unfinished step; do NOT repeat successful calls "
+            "merely to recreate completed work. Retry failed or incomplete work only after checking "
+            "the cause and current state.")
     return (
-        f"[System note: The previous turn was interrupted by "
+        f"{RESUME_RECOVERY_NOTE_PREFIX} "
         f"{reason_phrase}; the gateway is now back online. "
-        f"Any restart/shutdown command in the history has already "
-        f"run — do NOT re-execute or verify it. {resume_guidance} {tail_guidance}]"
+        f"Do NOT repeat a restart/shutdown command simply because its response was interrupted. "
+        f"Use recorded tool results as evidence. If a tool's effect is UNKNOWN, inspect current state "
+        f"with read-only checks before deciding whether any unfinished action is still needed. "
+        f"Read-only verification of the running revision or task outcome is allowed when required "
+        f"by the active request. {resume_guidance} {tail_guidance}]"
         + (f"\n\n{message}" if message else ""))
 
 
@@ -1059,6 +1060,11 @@ def _build_replay_entry(
     providers.
     """
     entry: Dict[str, Any] = {"role": role, "content": content}
+    # Runtime notices remain runtime notices after a reload. Compaction uses this
+    # provenance to avoid turning a background/recovery event into the human task.
+    for key in ("display_kind", "display_metadata"):
+        if msg.get(key):
+            entry[key] = msg[key]
     # api_content sidecar keeps the request prefix byte-stable — ONLY if this pipeline did not rewrite content.
     _sidecar = msg.get("api_content")
     if (
@@ -1164,6 +1170,12 @@ def _build_gateway_agent_history(
             continue
 
         content = msg.get("content")
+        # Recognize runtime wrappers before timestamp decoration hides their prefix.
+        # Real follow-up text survives; standalone recovery instructions never replay.
+        if role == "user":
+            content = _strip_auto_continue_noise(content)
+            if not content:
+                continue
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
@@ -1175,11 +1187,6 @@ def _build_gateway_agent_history(
             clean_msg = {k: v for k, v in msg.items() if k not in {"timestamp", "observed"}}
             agent_history.append(clean_msg)
         elif content:
-            # Strip persisted auto-continue notes: keep the real user text, never replay the recovery note.
-            if role == "user":
-                content = _strip_auto_continue_noise(content)
-                if not content:
-                    continue
             if msg.get("mirror"):
                 mirror_src = msg.get("mirror_source", "another session")
                 content = f"[Delivered from {mirror_src}] {content}"
@@ -1273,30 +1280,11 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool", "image
 
 # Replay-tail sanitization lives in agent/replay_cleanup.py so every resume surface shares one implementation.
 from agent.replay_cleanup import (  # noqa: E402
+    RESUME_RECOVERY_NOTE_PREFIX,
+    is_auto_continue_noise as _is_auto_continue_noise,
+    strip_auto_continue_noise as _strip_auto_continue_noise,
     strip_interrupted_tool_tails, strip_dangling_tool_call_tail, strip_stale_dangerous_confirmations)
 
-
-_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
-_AUTO_CONTINUE_FALLBACK_PREFIX = "[System note: A new message"
-
-
-def _is_auto_continue_noise(content: Any) -> bool:
-    """Return True if this user-message content is a gateway-injected auto-continue note (never replay it)."""
-    return isinstance(content, str) and content.startswith(
-        (_AUTO_CONTINUE_NOTE_PREFIX, _AUTO_CONTINUE_FALLBACK_PREFIX))
-
-
-def _strip_auto_continue_noise(content: Any) -> Any:
-    """Strip leading persisted auto-continue notes from user text; the trailing real question is preserved."""
-    if not _is_auto_continue_noise(content):
-        return content
-    text = str(content)
-    while _is_auto_continue_noise(text):
-        end = text.find("]")
-        if end < 0:
-            return ""
-        text = text[end + 1 :].lstrip()
-    return text
 
 # Tools whose deliverable is a JSON payload with a local-file path field rather than a literal ``MEDIA:`` tag.
 _JSON_MEDIA_TOOL_PATH_FIELDS = ("host_image", "image", "agent_visible_image")
