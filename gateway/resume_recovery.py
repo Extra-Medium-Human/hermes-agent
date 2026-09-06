@@ -2,6 +2,8 @@
 
 from typing import Optional
 
+from agent.replay_cleanup import RESUME_RECOVERY_NOTE_PREFIX
+
 
 def build_resume_recovery_note(
     reason: Optional[str], message: str = "", *, interactive: bool = True
@@ -22,10 +24,14 @@ def build_resume_recovery_note(
     )
     if message:
         resume_guidance = (
-            "Address the user's NEW message below FIRST and focus on what the user is asking now."
+            "Address the user's NEW message below FIRST and focus on what the user is asking now. "
+            "If it explicitly asks to resume or finish the interrupted task, continue from the next "
+            "unfinished step using recorded results. Status or reporting requests must report from "
+            "recorded history without resuming work. Otherwise do not revive unrelated unfinished work."
         )
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+            "Do NOT repeat successful tool calls merely to recreate completed work. "
+            "A failed or incomplete result may require a retry after checking the cause and current state."
         )
     else:
         resume_guidance = (
@@ -34,17 +40,20 @@ def build_resume_recovery_note(
             "CONTINUE the interrupted task to completion."
         )
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already appear in the history. "
-            "If a tool call has no recorded result, its effect is UNKNOWN. Inspect "
-            "current state before retrying. If the effect cannot be verified and "
-            "retrying could duplicate an external or irreversible action, stop and "
-            "ask one specific safety question."
+            "Use recorded results to identify the next unfinished step; do NOT repeat successful calls "
+            "merely to recreate completed work. Retry failed or incomplete work only after checking the "
+            "cause and current state. If a tool call has no recorded result, its effect is UNKNOWN. Inspect "
+            "current state before retrying. If the effect cannot be verified and retrying "
+            "could duplicate an external or irreversible action, stop and ask one specific safety question."
         )
     return (
-        f"[System note: The previous turn was interrupted by "
+        f"{RESUME_RECOVERY_NOTE_PREFIX} "
         f"{reason_phrase}; the gateway is now back online. "
-        f"Any restart/shutdown command in the history has already "
-        f"run — do NOT re-execute or verify it. {resume_guidance} {tail_guidance}]"
+        f"Do NOT repeat a restart/shutdown command simply because its response was interrupted. "
+        f"Use recorded tool results as evidence. If a tool's effect is UNKNOWN, inspect current state "
+        f"with read-only checks before deciding whether any unfinished action is still needed. "
+        f"Read-only verification of the running revision or task outcome is allowed when required "
+        f"by the active request. {resume_guidance} {tail_guidance}]"
         + (f"\n\n{message}" if message else "")
     )
 
