@@ -8,9 +8,10 @@ def build_resume_recovery_note(
 ) -> str:
     """Build the recovery note for an interrupted turn.
 
-    An empty ``message`` denotes the startup auto-resume event. Interactive
-    platforms currently report the restore and ask what comes next;
-    non-interactive platforms must continue because nobody can answer.
+    An empty ``message`` denotes the startup auto-resume event. It always
+    continues the saved work because acknowledging the restore would complete
+    the synthetic turn and clear the durable marker while abandoning the task.
+    ``interactive`` remains part of the call contract for adapter compatibility.
     """
     reason_phrase = (
         "a gateway restart"
@@ -26,19 +27,10 @@ def build_resume_recovery_note(
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
         )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
-        )
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
-        )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
+            "Do NOT emit only a 'session restored' acknowledgement "
+            "or ask the user to restate the task. Review the conversation history and "
             "CONTINUE the interrupted task to completion."
         )
         tail_guidance = (
