@@ -34,8 +34,11 @@ def build_resume_recovery_note(
             "CONTINUE the interrupted task to completion."
         )
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step that has no recorded result."
+            "Do NOT re-run tool calls whose results already appear in the history. "
+            "If a tool call has no recorded result, its effect is UNKNOWN. Inspect "
+            "current state before retrying. If the effect cannot be verified and "
+            "retrying could duplicate an external or irreversible action, stop and "
+            "ask one specific safety question."
         )
     return (
         f"[System note: The previous turn was interrupted by "

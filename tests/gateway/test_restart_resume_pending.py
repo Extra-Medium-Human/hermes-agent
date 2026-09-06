@@ -326,6 +326,8 @@ class TestResumePendingSystemNote:
         assert "ask what they would like to do next" not in note
         assert "skip any unfinished work" not in note
         assert "already appear in the history" in note
+        assert "effect is UNKNOWN" in note
+        assert "Inspect current state before retrying" in note
 
 
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
