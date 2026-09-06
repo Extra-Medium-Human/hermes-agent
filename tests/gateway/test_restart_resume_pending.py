@@ -40,9 +40,11 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
-    _prepare_resume_pending_message,
     _should_clear_resume_pending_after_turn,
+)
+from gateway.resume_recovery import (
     build_resume_recovery_note,
+    prepare_resume_pending_message,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
@@ -317,7 +319,7 @@ class TestResumePendingSystemNote:
 
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
         """The auto-resume note must not leave an empty row in state.db."""
-        message, persisted = _prepare_resume_pending_message(
+        message, persisted = prepare_resume_pending_message(
             "restart_timeout", "", interactive=False
         )
 
@@ -329,7 +331,7 @@ class TestResumePendingSystemNote:
     def test_whitespace_only_message_also_persists_the_note(self):
         """A whitespace-only startup event is as blank as an empty one —
         persisting it verbatim would recreate the sanitizer loop (#86580)."""
-        message, persisted = _prepare_resume_pending_message(
+        message, persisted = prepare_resume_pending_message(
             "shutdown_timeout", "   ", interactive=True
         )
 
@@ -340,7 +342,7 @@ class TestResumePendingSystemNote:
         """When the user typed real text while resume was pending, the durable
         transcript keeps their clean words; only the MODEL sees the wrapped
         recovery note (transcript stays scaffold-free)."""
-        message, persisted = _prepare_resume_pending_message(
+        message, persisted = prepare_resume_pending_message(
             "restart_timeout", "what were we doing?", interactive=True
         )
 
@@ -1256,5 +1258,4 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-
 

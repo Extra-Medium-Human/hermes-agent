@@ -1344,7 +1344,11 @@ class TurnRunner:
         """
         from gateway.run import (
             _auto_continue_freshness_window, _is_fresh_gateway_interruption,
-            _last_transcript_timestamp, _prepare_resume_pending_message, build_resume_recovery_note,
+            _last_transcript_timestamp,
+        )
+        from gateway.resume_recovery import (
+            build_resume_recovery_note,
+            prepare_resume_pending_message,
         )
         ctx = self._ctx
         persist_override: Optional[Any] = ctx.persist_user_message
@@ -1369,7 +1373,7 @@ class TurnRunner:
         )
         if resume_pending and (interruption_is_fresh or mark_is_fresh):
             # Empty message = the startup auto-resume turn; there is no NEW user message.
-            ctx.message, persist_override = _prepare_resume_pending_message(
+            ctx.message, persist_override = prepare_resume_pending_message(
                 resume_reason, ctx.message, interactive=self._resume_note_interactive(),
             )
         elif agent_history and agent_history[-1].get("role") == "tool" and interruption_is_fresh:
