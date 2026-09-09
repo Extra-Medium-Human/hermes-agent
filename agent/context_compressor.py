@@ -3582,7 +3582,8 @@ Write only the summary body. Do not include any preamble or prefix."""
         """Recognize operational rows by durable provenance, with markers for older transcripts."""
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
-        if message.get("display_kind") or cls._is_context_summary_message(message):
+        display_kind = message.get("display_kind")
+        if (display_kind and display_kind != STEER_DISPLAY_KIND) or cls._is_context_summary_message(message):
             return True
         text = _content_text_for_contains(message.get("content")).strip()
         from agent.replay_cleanup import is_auto_continue_noise, strip_auto_continue_noise
