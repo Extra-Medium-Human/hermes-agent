@@ -84,6 +84,13 @@ class TestSmartApproval:
 
 
 class TestDetectDangerousRm:
+    def test_home_prefix_normalization_preserves_absolute_delete_guard(self, tmp_path, monkeypatch):
+        home = tmp_path / "operator-home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        for operand in (str(home / "important.txt"), "~/important.txt"):
+            assert detect_dangerous_command(f"rm -f {operand}")[0] is True
+
     def test_rm_flags_after_operands_detected(self):
         # GNU rm permutes options: `rm build/ -rf` == `rm -rf build/`.
         # Port of openai/codex#33464.
@@ -100,9 +107,10 @@ class TestDetectDangerousRm:
 
 
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+        temp_dir = os.path.realpath("/tmp")  # /tmp is an OS symlink on macOS.
+        with mock_patch("tempfile.gettempdir", return_value=temp_dir):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                assert detect_dangerous_command(f"rm -f {temp_dir}/{prefix}example.py") == (
                     False,
                     None,
                     None,

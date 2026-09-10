@@ -365,8 +365,5 @@
         "reason": "Ordinary quality uses local mock inference and excludes integration, SSH, container and live-provider suites."
       }
     }
-  },
-  "prerequisites": [
-    "rg"
-  ]
+  }
 }

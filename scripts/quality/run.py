@@ -26,6 +26,11 @@ def main() -> int:
         for child in ['tmp', 'hermes', 'config', 'cache']:
             (home / child).mkdir()
         env = {key: os.environ[key] for key in ['PATH', 'SYSTEMROOT', 'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY'] if key in os.environ}
+        # JS parity tests and desktop subprocesses must see the same pinned
+        # Python environment that bootstrap installed for the Python runner.
+        venv_bin = ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')
+        if venv_bin.is_dir():
+            env['PATH'] = str(venv_bin) + os.pathsep + env.get('PATH', '')
         for key in ['QUALITY_BASE', 'QUALITY_HEAD']:
             if re.fullmatch(r'[0-9a-f]{40}', os.environ.get(key, '')):
                 env[key] = os.environ[key]

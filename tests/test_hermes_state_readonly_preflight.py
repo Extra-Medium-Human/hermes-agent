@@ -17,6 +17,7 @@ from deep inside ``_init_schema`` — naming no file and no fix.
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -53,20 +54,20 @@ def _make_db(path: Path) -> None:
 
 def _make_wal_db(path: Path) -> None:
     """Create a WAL-mode DB with committed-but-uncheckpointed frames."""
-    conn = sqlite3.connect(str(path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE t (x)")
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    # Keep a READ-ONLY second connection open so neither close can
-    # checkpoint: the writer skips checkpoint-on-close because another
-    # connection exists, and the ro holder cannot checkpoint at all.
-    # The committed row therefore lives only in the -wal file.
-    holder = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    holder.execute("SELECT 1").fetchone()
-    conn.execute("INSERT INTO t VALUES (42)")
-    conn.commit()
-    conn.close()
-    holder.close()
+    # A clean last-connection close can checkpoint even a read-only holder,
+    # depending on SQLite's version. Exit a fixture-only child after commit
+    # to model the real interrupted writer without checkpoint-on-close.
+    subprocess.run([sys.executable, "-c", """
+import os, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA wal_autocheckpoint=0")
+conn.execute("CREATE TABLE t (x)")
+conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+conn.execute("INSERT INTO t VALUES (42)")
+conn.commit()
+os._exit(0)
+""", str(path)], check=True)
     assert path.with_name(path.name + "-wal").is_file(), (
         "fixture precondition: -wal sidecar must survive with pending frames"
     )
@@ -94,6 +95,11 @@ class TestRepairScope:
 
         assert os.access(db, os.W_OK)
         assert os.access(wal, os.W_OK)
+        connection = sqlite3.connect(db)
+        try:
+            assert connection.execute("SELECT x FROM t").fetchall() == [(42,)]
+        finally:
+            connection.close()
 
 
     def test_repairs_readonly_parent_directory(self, hermes_home):

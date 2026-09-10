@@ -12,11 +12,14 @@ The existing Python per-file runner remains authoritative. Full quality uses
 one file-isolated run with four workers. Sequential duration-balanced slices
 would change membership as each slice updates its timing cache, creating
 duplicates and coverage gaps. Retries are disabled so a failing attempt is not
-converted into a pass. Linux CI installs ripgrep for real search-tool fixtures.
+converted into a pass. Linux CI installs ripgrep for real search-tool fixtures;
+bootstrap verifies it on Linux. The macOS desktop job has no ripgrep dependency.
 
 Python checks and Electron launches receive short disposable homes with no credentials.
 The adapter does not nest HOME below an outer runner TMPDIR, preserving Unix
 socket path budgets for pytest and desktop fixtures.
+Subprocesses use the lockfile-installed Python environment, including the TUI's
+Python command registry checks.
 The SSH runtime also handles long or multibyte user home paths with a short
 per-user, per-home socket directory. It verifies directory ownership, rejects
 symlinks and requires private permissions before even probing an existing socket.

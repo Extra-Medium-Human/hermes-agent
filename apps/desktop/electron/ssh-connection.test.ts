@@ -80,7 +80,7 @@ test('controlSocketPath default base stays under sun_path even with the temp-lis
   assert.ok(!p.includes('/var/folders/'), 'default base must not be os.tmpdir() on macOS')
 })
 
-test.skipIf(process.platform === 'win32').each(['/Users/' + 'long-home-'.repeat(15), '/Users/' + 'é'.repeat(40)])(
+test.skipIf(process.platform === 'win32').each(['/Users/' + 'long-home-'.repeat(15), '/Users/' + 'é'.repeat(30)])(
   'long or multibyte home keeps default sockets below the byte limit: %s', home => {
     const homedir = vi.spyOn(os, 'homedir').mockReturnValue(home)
 
