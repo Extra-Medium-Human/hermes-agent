@@ -567,6 +567,14 @@ class TestPatternKeyUniqueness:
         )
         _clear_session(session)
 
+    def test_legacy_absolute_delete_key_still_approves_canonical_rule(self):
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            load_permanent({r"rm\s+(-[^\s]*\s+)*/"})
+            for command in ("rm -f /var/tmp/old-approved-file", "rm -f ~/old-approved-file"):
+                dangerous, key, _ = detect_dangerous_command(command)
+                assert dangerous is True
+                assert is_approved("legacy-absolute-delete", key) is True
+
     def test_legacy_find_key_still_approves_both_variants(self):
         """Old colliding allowlist entry 'find' should remain backwards compatible."""
         _, key_exec, _ = detect_dangerous_command("find . -exec rm {} \\;")
