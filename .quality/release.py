@@ -2,11 +2,14 @@
 """Promote a verified production artifact and recover without touching persistent data."""
 from __future__ import annotations
 import argparse
+import base64
+import concurrent.futures
 import datetime as dt
 import fnmatch
+import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -39,7 +42,105 @@ def vercel(path, token, team, method='GET', body=None):
             return json.loads(data) if data else {}
     except urllib.error.HTTPError as error:
         # Provider responses may contain credentials or environment values.
-        raise ReleaseError(f'Vercel {method} {path.split("?")[0]} returned HTTP {error.code}') from None
+        provider_code = None
+        try:
+            value = json.loads(error.read(65536)).get('error', {}).get('code')
+            if value == 'incorrect_git_source_info':
+                provider_code = value
+        except (ValueError, AttributeError):
+            pass
+        failure = ReleaseError(f'Vercel {method} {path.split("?")[0]} returned HTTP {error.code}')
+        failure.provider_code, failure.http_status = provider_code, error.code
+        raise failure from None
+
+
+def committed_source(candidate, exclusions=(), root='.'):
+    """Read deployment inputs from Git objects, never the credential-bearing checkout."""
+    if not re.fullmatch(r'[0-9a-f]{40}', candidate):
+        raise ReleaseError('Source upload requires an immutable commit')
+    if not isinstance(exclusions, (list, tuple)) or not all(isinstance(p, str) for p in exclusions):
+        raise ReleaseError('Source exclusions must be a list of explicit paths')
+    for path in exclusions:
+        parts = PurePosixPath(path).parts
+        if not parts or path.startswith('/') or any(p in {'.', '..'} for p in path.split('/')):
+            raise ReleaseError('Source exclusions require explicit repository-relative paths')
+    tree = subprocess.check_output(['git', 'rev-parse', candidate+'^{tree}'], cwd=root).decode().strip()
+    entries = subprocess.check_output(['git', 'ls-tree', '-rlz', '--full-tree', candidate], cwd=root)
+    files, total = [], 0
+    for entry in entries.split(b'\0'):
+        if not entry:
+            continue
+        metadata, raw_path = entry.split(b'\t', 1)
+        mode, kind, oid, size = metadata.decode().split()
+        path = raw_path.decode()
+        if path.startswith('/') or any(p in {'.', '..', '.git'} for p in path.split('/')) or any(ord(c) < 32 for c in path):
+            raise ReleaseError('Unsafe committed source path')
+        if any(path == skip or path.startswith(skip+'/') for skip in exclusions):
+            continue
+        if kind != 'blob' or mode not in {'100644', '100755'}:
+            raise ReleaseError('Source upload requires regular tracked files; declare any non-runtime exclusions explicitly')
+        name = PurePosixPath(path).name
+        if name.startswith('.env') and not (name.endswith(('.example', '.template')) or name in {'.env.example', '.env.template'}):
+            raise ReleaseError('Refusing to upload a tracked environment file')
+        total += int(size)
+        if total > 256*1024*1024 or len(files) >= 10000:
+            raise ReleaseError('Committed deployment source exceeds the bounded upload limit')
+        data = subprocess.check_output(['git', 'cat-file', 'blob', oid], cwd=root)
+        identity = hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+        if len(data) != int(size) or identity != oid:
+            raise ReleaseError('Committed source identity changed')
+        files.append({'file':path, 'data':data, 'sha':hashlib.sha1(data).hexdigest(), 'size':len(data)})
+    if not files:
+        raise ReleaseError('Deployment source is empty')
+    return tree, files, total
+
+
+def upload_source_file(file, token, team):
+    request = urllib.request.Request('https://api.vercel.com/v2/files?'+urllib.parse.urlencode({'teamId':team}),
+        method='POST', data=file['data'], headers={'Authorization':'Bearer '+token,
+        'Content-Type':'application/octet-stream', 'Content-Length':str(file['size']), 'x-vercel-digest':file['sha']})
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            response.read()
+    except urllib.error.HTTPError as error:
+        raise ReleaseError(f'Vercel source upload returned HTTP {error.code}') from None
+
+
+def create_staged_deployment(manifest, candidate, project, token, team):
+    config = manifest['release']['vercel']
+    body = {'name':project['name'], 'project':config['project_id'], 'target':'production',
+            'gitSource':{'type':'github', 'repoId':config['repository_id'], 'ref':candidate, 'sha':candidate},
+            'meta':{'githubCommitSha':candidate, 'qualityRepository':manifest['repository']}}
+    try:
+        return vercel('/v13/deployments', token, team, 'POST', body)
+    except ReleaseError as error:
+        if getattr(error, 'http_status', None) != 400 or getattr(error, 'provider_code', None) != 'incorrect_git_source_info':
+            raise
+    # A moved private repository can retain its stable project identity while
+    # Vercel's old Git installation cannot read it. GitHub already checked out
+    # and verified this exact commit; upload those committed bytes via the API.
+    tree, files, total = committed_source(candidate, config.get('source_exclude_paths', []))
+    if not is_current_candidate(manifest, candidate):
+        raise ReleaseError('Candidate was superseded before source upload')
+    if total <= 2*1024*1024:
+        payload = [{'file':f['file'], 'encoding':'base64', 'data':base64.b64encode(f['data']).decode()} for f in files]
+    else:
+        unique = {f['sha']:f for f in files}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(lambda f: upload_source_file(f, token, team), unique.values()))
+        payload = [{key:f[key] for key in ('file', 'sha', 'size')} for f in files]
+    if not is_current_candidate(manifest, candidate):
+        raise ReleaseError('Candidate was superseded during source upload')
+    current = vercel('/v9/projects/'+config['project_id'], token, team)
+    if current.get('autoAssignCustomDomains') is not False or str(current.get('link',{}).get('repoId')) != str(config['repository_id']):
+        raise ReleaseError('Project identity or staging settings changed during source upload')
+    body.pop('gitSource')
+    body['files'] = payload
+    body['meta'].update(qualitySourceTree=tree, qualitySourceTransport='committed-files')
+    body['gitMetadata'] = {'remoteUrl':'https://github.com/'+manifest['repository'],
+                          'commitRef':manifest.get('default_branch','main'), 'commitSha':candidate, 'dirty':False}
+    print(f'Uploading verified committed source: {len(files)} files, {total} bytes')
+    return vercel('/v13/deployments', token, team, 'POST', body)
 
 
 def state_compatible(previous, candidate, patterns):
@@ -243,24 +344,25 @@ def run(manifest, candidate, deployment_id, state_path):
     if not deployment_id:
         deployments = vercel('/v6/deployments?'+urllib.parse.urlencode({'projectId':project_id, 'target':'production', 'limit':100}), token, team)['deployments']
         matches = [d for d in deployments if d.get('meta',{}).get('githubCommitSha') == candidate
-                   and d.get('target') == 'production' and d.get('state', d.get('readyState')) == 'READY']
+                   and d.get('target') == 'production'
+                   and d.get('state', d.get('readyState')) in {'READY', 'INITIALIZING', 'QUEUED', 'BUILDING'}]
+        matches.sort(key=lambda d: d.get('state', d.get('readyState')) != 'READY')
         if not matches:
-            created = vercel('/v13/deployments', token, team, 'POST',
-                             {'name':project['name'], 'project':project_id, 'target':'production',
-                              'gitSource':{'type':'github', 'repoId':config['repository_id'], 'ref':candidate, 'sha':candidate},
-                              'meta':{'githubCommitSha':candidate, 'qualityRepository':manifest['repository']}})
+            created = create_staged_deployment(manifest, candidate, project, token, team)
             deployment_id = created['id']
-            for _ in range(120):
-                pending = vercel('/v13/deployments/'+deployment_id, token, team)
-                if pending.get('readyState') == 'READY':
-                    break
-                if pending.get('readyState') in {'ERROR', 'CANCELED'}:
-                    raise ReleaseError('Production-environment build failed')
-                time.sleep(10)
-            else:
-                raise ReleaseError('Production-environment build timed out')
         else:
             deployment_id = matches[0].get('uid') or matches[0].get('id')
+        state.update(deployment_id=deployment_id, status='staging')
+        ci.write(state_path, state)
+        for _ in range(120):
+            pending = vercel('/v13/deployments/'+deployment_id, token, team)
+            if pending.get('readyState') == 'READY':
+                break
+            if pending.get('readyState') in {'ERROR', 'CANCELED'}:
+                raise ReleaseError('Production-environment build failed')
+            time.sleep(10)
+        else:
+            raise ReleaseError('Production-environment build timed out')
     deployment = vercel('/v13/deployments/'+deployment_id, token, team)
     if (deployment.get('target') != 'production' or deployment.get('readyState') != 'READY'
             or deployment.get('projectId') != project_id or deployment.get('meta',{}).get('githubCommitSha') != candidate):
@@ -323,7 +425,7 @@ def main():
     parser.add_argument('--state', default='.quality-release/release.json')
     args = parser.parse_args()
     try:
-        result = run(json.loads(Path('.quality.json').read_text()), args.candidate, args.deployment, args.state)
+        result = run(json.loads(Path('.quality.json').read_text(encoding='utf-8')), args.candidate, args.deployment, args.state)
         print(json.dumps({k:result[k] for k in ['status','candidate','deployment_id','completed_at']}))
         return 0
     except (ReleaseError, ValueError, OSError, subprocess.SubprocessError) as error:

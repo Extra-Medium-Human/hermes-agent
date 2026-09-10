@@ -177,7 +177,7 @@ jobs:
           QUALITY_NEEDS: ${{ toJSON(needs) }}
         run: |
           mkdir -p .quality-results
-          python3 -c 'import os,pathlib; pathlib.Path(".quality-results/needs.json").write_text(os.environ["QUALITY_NEEDS"])'
+          python3 -c 'import os,pathlib; pathlib.Path(".quality-results/needs.json").write_text(os.environ["QUALITY_NEEDS"], encoding="utf-8")'
           python3 .quality/ci.py aggregate
       - uses: actions/upload-artifact@@@upload-artifact@@
         if: always()
@@ -247,7 +247,7 @@ def render(manifest):
     result = result.replace('      - name: Bootstrap disposable test environment\n', prerequisites + '      - name: Bootstrap disposable test environment\n')
     result = result.replace('      - name: Run selected checks once\n', setup + '      - name: Run selected checks once\n')
     diagnostics = ci.get('diagnostic_paths', [])
-    permitted = {'test-results/playwright.json', 'apps/web/test-results/playwright.json', 'playwright-report', 'apps/web/playwright-report'}
+    permitted = {'test-results/playwright.json', 'test-results/mutation-summary.json', 'apps/web/test-results/playwright.json', 'playwright-report', 'apps/web/playwright-report'}
     if not set(diagnostics) <= permitted:
         raise ValueError('Diagnostic artifacts require explicit safe paths')
     diagnostic_step = ''
@@ -302,7 +302,7 @@ jobs:
   release:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@CHECKOUT
         with:
@@ -371,19 +371,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    expected = render(json.loads(Path('.quality.json').read_text()))
+    expected = render(json.loads(Path('.quality.json').read_text(encoding='utf-8')))
     path = Path('.github/workflows/quality.yml')
     if args.check:
-        if not path.exists() or path.read_text() != expected:
+        if not path.exists() or path.read_text(encoding='utf-8') != expected:
             raise SystemExit('Quality workflow differs from adapter; run python3 .quality/workflow.py')
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(expected)
-    release_workflow = render_release(json.loads(Path('.quality.json').read_text()))
+        path.write_text(expected, encoding='utf-8')
+    release_workflow = render_release(json.loads(Path('.quality.json').read_text(encoding='utf-8')))
     if release_workflow:
         release_path=Path('.github/workflows/quality-release.yml')
         if args.check:
-            if not release_path.exists() or release_path.read_text()!=release_workflow:
+            if not release_path.exists() or release_path.read_text(encoding='utf-8')!=release_workflow:
                 raise SystemExit('Release workflow differs from adapter; regenerate')
         else:
-            release_path.write_text(release_workflow)
+            release_path.write_text(release_workflow, encoding='utf-8')

@@ -28,7 +28,7 @@ def api(path, binary=False):
 def write(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2) + '\n')
+    path.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
 
 
 def engine(*args):
@@ -132,8 +132,8 @@ def choose_baseline(records, head, fresh=True):
 
 
 def select(event_path, outdir):
-    event = json.loads(Path(event_path).read_text())
-    manifest = json.loads(Path('.quality.json').read_text())
+    event = json.loads(Path(event_path).read_text(encoding='utf-8'))
+    manifest = json.loads(Path('.quality.json').read_text(encoding='utf-8'))
     event_name = os.environ.get('GITHUB_EVENT_NAME', 'workflow_dispatch')
     head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     base = event.get('pull_request', {}).get('base', {}).get('sha') or event.get('before')
@@ -178,14 +178,14 @@ def select(event_path, outdir):
     if full:
         args.append('--full')
     engine(*args)
-    plan = json.loads((outdir/'selection.json').read_text())
+    plan = json.loads((outdir/'selection.json').read_text(encoding='utf-8'))
     runners = sorted({check['runner'] for check in plan['checks']})
     matrix = {'include': [{'runner': runner, 'bootstrap': any(c['runner'] == runner and c['kind'] != 'docs' for c in plan['checks'])} for runner in runners] or [{'runner': 'ubuntu-24.04', 'bootstrap': False}]}
     outputs = {'base': base, 'head': head, 'mode': 'full' if plan['full'] else 'affected',
                'has_checks': str(bool(runners)).lower(), 'matrix': json.dumps(matrix), 'reason': reason,
                'runtimes': json.dumps(manifest.get('runtimes', {}))}
     if os.environ.get('GITHUB_OUTPUT'):
-        with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+        with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
             for key, value in outputs.items():
                 if '\n' in str(value):
                     raise ValueError('Invalid multiline workflow output')
@@ -199,13 +199,13 @@ def aggregate(directory, needs):
     args = ['aggregate', '--selection', directory/'selection.json', '--needs-json', needs,
             '--output', directory/'summary.json']
     for path in sorted(directory.glob('checks/**/*.json')):
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(encoding='utf-8'))
         if isinstance(value, dict) and {'head', 'checks', 'provenance'} <= value.keys():
             args.extend(['--evidence', path])
     result = subprocess.run([sys.executable, str(ENGINE), *map(str, args)])
     summary = directory/'summary.json'
     if summary.exists():
-        print(summary.read_text())
+        print(summary.read_text(encoding='utf-8'))
     return result.returncode
 
 
@@ -222,11 +222,11 @@ def main():
     if args.command == 'select':
         select(args.event, args.directory)
     elif args.command == 'history':
-        manifest = json.loads(Path('.quality.json').read_text())
+        manifest = json.loads(Path('.quality.json').read_text(encoding='utf-8'))
         history(manifest['repository'], manifest.get('default_branch', 'main'), args.directory)
     elif args.command == 'release-verify':
         from release import ReleaseError, verify_coverage, ensure_coverage
-        manifest = json.loads(Path('.quality.json').read_text())
+        manifest = json.loads(Path('.quality.json').read_text(encoding='utf-8'))
         candidate = subprocess.check_output(['git', 'rev-parse', args.candidate], text=True).strip()
         try:
             if args.ensure_full or args.force_full:

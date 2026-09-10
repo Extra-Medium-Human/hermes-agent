@@ -182,15 +182,8 @@
       "checks": [
         "root-js",
         "python-runtime",
-        "python-full-1",
-        "python-full-2",
-        "python-full-3",
-        "python-full-4",
-        "python-full-5",
-        "python-full-6",
-        "python-full-7",
-        "python-full-8",
-        "python-affected"
+        "python-affected",
+        "python-full"
       ],
       "critical_behaviors": [
         "Unknown, failed, cancelled, and missing validation cannot be reported as passing."
@@ -298,54 +291,6 @@
       "kind": "critical",
       "runner": "ubuntu-24.04"
     },
-    "python-full-1": {
-      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 1/8 -m 'not integration and not ssh'",
-      "timeout": 3600,
-      "kind": "full",
-      "runner": "ubuntu-24.04"
-    },
-    "python-full-2": {
-      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 2/8 -m 'not integration and not ssh'",
-      "timeout": 3600,
-      "kind": "full",
-      "runner": "ubuntu-24.04"
-    },
-    "python-full-3": {
-      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 3/8 -m 'not integration and not ssh'",
-      "timeout": 3600,
-      "kind": "full",
-      "runner": "ubuntu-24.04"
-    },
-    "python-full-4": {
-      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 4/8 -m 'not integration and not ssh'",
-      "timeout": 3600,
-      "kind": "full",
-      "runner": "ubuntu-24.04"
-    },
-    "python-full-5": {
-      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 5/8 -m 'not integration and not ssh'",
-      "timeout": 3600,
-      "kind": "full",
-      "runner": "ubuntu-24.04"
-    },
-    "python-full-6": {
-      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 6/8 -m 'not integration and not ssh'",
-      "timeout": 3600,
-      "kind": "full",
-      "runner": "ubuntu-24.04"
-    },
-    "python-full-7": {
-      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 7/8 -m 'not integration and not ssh'",
-      "timeout": 3600,
-      "kind": "full",
-      "runner": "ubuntu-24.04"
-    },
-    "python-full-8": {
-      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 8/8 -m 'not integration and not ssh'",
-      "timeout": 3600,
-      "kind": "full",
-      "runner": "ubuntu-24.04"
-    },
     "python-affected": {
       "command": "python3 scripts/quality/run.py python3 scripts/quality/python_affected.py",
       "timeout": 3600,
@@ -354,6 +299,12 @@
       "inputs": [
         "tests/**/*.py"
       ]
+    },
+    "python-full": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
     }
   },
   "docs": {
@@ -382,7 +333,10 @@
   ],
   "ci": {
     "nightly_minute": 20,
-    "compilation_caches": []
+    "compilation_caches": [],
+    "system_packages": [
+      "ripgrep"
+    ]
   },
   "release": {
     "kind": "desktop",
@@ -411,5 +365,8 @@
         "reason": "Ordinary quality uses local mock inference and excludes integration, SSH, container and live-provider suites."
       }
     }
-  }
+  },
+  "prerequisites": [
+    "rg"
+  ]
 }

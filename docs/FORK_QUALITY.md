@@ -8,11 +8,18 @@ Use the shared `.quality/quality.py` entrypoint after the pinned engine is
 vendored: `doctor`, `bootstrap`, then `run --base <sha> --head <sha>` for the
 affected graph, or `full` for the overnight offline regression. The adapter pins
 Python, uv, Node and npm and installs `uv.lock` and `package-lock.json` frozen.
-The existing Python per-file runner and eight duration-balanced slices remain
-authoritative. Retries are disabled for quality evidence so a failing attempt
-is not converted into a pass.
+The existing Python per-file runner remains authoritative. Full quality uses
+one file-isolated run with four workers. Sequential duration-balanced slices
+would change membership as each slice updates its timing cache, creating
+duplicates and coverage gaps. Retries are disabled so a failing attempt is not
+converted into a pass. Linux CI installs ripgrep for real search-tool fixtures.
 
-Python checks and Electron launches receive disposable homes with no credentials.
+Python checks and Electron launches receive short disposable homes with no credentials.
+The adapter does not nest HOME below an outer runner TMPDIR, preserving Unix
+socket path budgets for pytest and desktop fixtures.
+The SSH runtime also handles long or multibyte user home paths with a short
+per-user, per-home socket directory. It verifies directory ownership, rejects
+symlinks and requires private permissions before even probing an existing socket.
 Python subprocesses reject remote network connections. Desktop tests use the
 real local backend and synthetic inference server, never a paid provider. The
 macOS desktop build is reused for the boot/chat smoke; that run disables
@@ -33,3 +40,7 @@ agent self-reviews the affected behavior and reuses unchanged passing evidence.
 Independent review, review labels, receipt files, frozen-commit verdicts and
 upstream infographic/comment rituals are not delivery gates in this user fork.
 Runtime safeguards for user data and external effects still apply.
+
+Inherited Nous Research workflow definitions are archived under
+`.github/upstream-workflows/` as reference only. They have no active publishing
+or scheduled triggers in this fork; only the fork-owned Quality workflow runs.

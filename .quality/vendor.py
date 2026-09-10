@@ -39,13 +39,13 @@ def install(source, target, ref):
         destination.write_bytes(data)
     manifest = {"schema_version": 1, "source": "deathxdefeat/repository-operations", "revision": revision,
                 "files": {path: sha(data) for path, data in contents.items()}}
-    (target / ".quality/vendor.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    (target / ".quality/vendor.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
 
 
 def verify(target):
     target = Path(target).resolve()
-    manifest = json.loads((target / ".quality/vendor.json").read_text())
+    manifest = json.loads((target / ".quality/vendor.json").read_text(encoding="utf-8"))
     if manifest.get("schema_version") != 1 or manifest.get("source") != "deathxdefeat/repository-operations":
         raise ValueError("Unsupported vendor source or schema")
     if len(manifest.get("revision", "")) != 40 or any(c not in "0123456789abcdef" for c in manifest["revision"]):

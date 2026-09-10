@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
   baseSshOptions,
@@ -78,6 +78,51 @@ test('controlSocketPath default base stays under sun_path even with the temp-lis
   )
   // And it must NOT live under the deeply-nested macOS per-user temp dir.
   assert.ok(!p.includes('/var/folders/'), 'default base must not be os.tmpdir() on macOS')
+})
+
+test.skipIf(process.platform === 'win32').each(['/Users/' + 'long-home-'.repeat(15), '/Users/' + 'é'.repeat(40)])(
+  'long or multibyte home keeps default sockets below the byte limit: %s', home => {
+    const homedir = vi.spyOn(os, 'homedir').mockReturnValue(home)
+
+    try {
+      const first = controlSocketPath('me', 'host', 22)
+      assert.ok(Buffer.byteLength(`${first}.0123456789abcdef`) < 104)
+      assert.equal(first, controlSocketPath('me', 'host', 22), 'reconnects reuse the same socket')
+      homedir.mockReturnValue(home + '-other')
+      assert.notEqual(first, controlSocketPath('me', 'host', 22), 'different homes stay isolated')
+    } finally {
+      homedir.mockRestore()
+    }
+  }
+)
+
+test.skipIf(process.platform === 'win32')('long-home fallback creates a private directory before the first SSH probe', async () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-long-home-'))
+  const homedir = vi.spyOn(os, 'homedir').mockReturnValue(path.join(fixture, 'nested-home-'.repeat(12)))
+  const directory = path.dirname(controlSocketPath('me', 'host', 22))
+  assert.ok(!fs.existsSync(directory), 'fixture must own a fresh fallback directory')
+  let calls = 0
+
+  const spawnFn = scriptedSpawn(args => {
+    const stat = fs.lstatSync(directory)
+    assert.ok(stat.isDirectory() && !stat.isSymbolicLink())
+    assert.equal(stat.uid, process.getuid!())
+    assert.equal(stat.mode & 0o777, 0o700)
+    calls += 1
+
+    return { code: args.includes('check') ? 255 : 0 }
+  })
+
+  try {
+    const conn = new SshConnection({ host: 'host', user: 'me' }, { spawnFn })
+    await conn.open()
+    assert.equal(calls, 2)
+    await conn.close()
+  } finally {
+    homedir.mockRestore()
+    fs.rmSync(directory, { recursive: true, force: true })
+    fs.rmSync(fixture, { recursive: true, force: true })
+  }
 })
 
 test('baseSshOptions carries the house ControlMaster/BatchMode/accept-new policy', () => {
@@ -723,9 +768,11 @@ test('open() rejects a control-dir that is a symlink', async () => {
   const link = path.join(tmp, 'link')
   fs.mkdirSync(real, { mode: 0o700 })
   fs.symlinkSync(real, link)
-  const spawnFn = scriptedSpawn(args => (args.includes('check') ? { code: 255 } : { code: 0 }))
+  const spawnFn = vi.fn(() => { throw new Error('Unsafe directory must fail before spawning SSH') })
   const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: link })
+  assert.equal(await conn.isAlive(), false, 'An unsafe socket is never considered live')
   await assert.rejects(conn.open(), /symlink|unsafe/i)
+  assert.equal(spawnFn.mock.calls.length, 0)
   fs.rmSync(tmp, { recursive: true, force: true })
 })
 

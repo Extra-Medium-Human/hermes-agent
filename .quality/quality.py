@@ -58,7 +58,7 @@ def output(value, path=None):
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_name(target.name + ".tmp")
-        temp.write_text(content)
+        temp.write_text(content, encoding="utf-8")
         temp.replace(target)
     else:
         print(content, end="")
@@ -742,7 +742,7 @@ def main(argv=None):
                 for index, command in enumerate(manifest.get("bootstrap", [])):
                     status, code, duration = execute(command, root, env, 1800, home / f"bootstrap-{index}.log")
                     if status != PASS:
-                        print((home / f"bootstrap-{index}.log").read_text(errors="replace"), file=sys.stderr)
+                        print((home / f"bootstrap-{index}.log").read_text(encoding="utf-8", errors="replace"), file=sys.stderr)
                         raise QualityError(f"Bootstrap command {index + 1} {status} (exit {code})")
                     results.append({"step": index + 1, "status": status, "duration_seconds": duration})
             result = {"status": PASS, "steps": results}
@@ -753,18 +753,18 @@ def main(argv=None):
             else:
                 result = run_checks(root, manifest, selection, args.runner, args.evidence_dir)
         elif args.command == "aggregate":
-            selection = json.loads(Path(args.selection).read_text())
+            selection = json.loads(Path(args.selection).read_text(encoding="utf-8"))
             expected_selection = select(root, manifest, selection["base"], selection["head"], selection["full"])
             if expected_selection != selection:
                 raise QualityError("Selection does not match the current adapter and committed inputs")
             records = [record for record, _ in read_records(args.evidence)]
-            needs = json.loads(Path(args.needs_json).read_text()) if args.needs_json else None
+            needs = json.loads(Path(args.needs_json).read_text(encoding="utf-8")) if args.needs_json else None
             result = aggregate(selection, records, needs)
         elif args.command == "release":
-            runs = json.loads(Path(args.trusted_runs).read_text())
+            runs = json.loads(Path(args.trusted_runs).read_text(encoding="utf-8"))
             result = release_verify(root, manifest, args.candidate, read_records(args.baseline), read_records(args.evidence), runs)
         else:
-            runs = json.loads(Path(args.trusted_runs).read_text()) if args.trusted_runs else []
+            runs = json.loads(Path(args.trusted_runs).read_text(encoding="utf-8")) if args.trusted_runs else []
             result = nightly(root, manifest, args.head, read_records(args.previous), runs,
                              timestamp(args.now) if args.now else None, args.slot)
         output(result, getattr(args, "output", None))

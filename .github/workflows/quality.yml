@@ -100,6 +100,9 @@ jobs:
             .quality-cache/ms-playwright
 
           key: quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.quality.json', '.quality/**', '**/package-lock.json', '**/pnpm-lock.yaml', '**/uv.lock', '**/requirements*.txt', '**/Cargo.lock', '**/next.config.*', '**/tsconfig.json') }}
+      - name: Linux test prerequisites
+        if: ${{ matrix.bootstrap && runner.os == 'Linux' }}
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
       - run: npm install --global npm@10.9.8 --ignore-scripts
       - run: python3 -m pip install --disable-pip-version-check uv==0.12.9
       - name: Bootstrap disposable test environment
@@ -164,7 +167,7 @@ jobs:
           QUALITY_NEEDS: ${{ toJSON(needs) }}
         run: |
           mkdir -p .quality-results
-          python3 -c 'import os,pathlib; pathlib.Path(".quality-results/needs.json").write_text(os.environ["QUALITY_NEEDS"])'
+          python3 -c 'import os,pathlib; pathlib.Path(".quality-results/needs.json").write_text(os.environ["QUALITY_NEEDS"], encoding="utf-8")'
           python3 .quality/ci.py aggregate
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()

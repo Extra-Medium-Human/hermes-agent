@@ -17,7 +17,11 @@ def main() -> int:
         raise SystemExit('usage: python3 scripts/quality/run.py COMMAND [ARG ...]')
     if (ROOT / '.env').exists():
         raise SystemExit('Quality requires an isolated checkout without a root .env file.')
-    with tempfile.TemporaryDirectory(prefix='hermes-quality-') as directory:
+    # A check may itself be launched inside the engine's temporary HOME. Do
+    # not nest again under its TMPDIR: real Unix socket fixtures need room for
+    # pytest paths and OpenSSH's temporary listener suffix.
+    temporary_root = '/tmp' if os.name == 'posix' else None
+    with tempfile.TemporaryDirectory(prefix='hq-', dir=temporary_root) as directory:
         home = Path(directory)
         for child in ['tmp', 'hermes', 'config', 'cache']:
             (home / child).mkdir()
