@@ -21,6 +21,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -29,64 +30,11 @@ import { _electron, type ElectronApplication, type Page } from '@playwright/test
 
 import { startMockServer, type MockServerOptions } from './mock-server'
 import { installErrorBannerGuard } from './test'
+import { isolatedDesktopEnv } from './sandbox-env'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
 const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
-
-// ─── Credential stripping (matches launch.spec.ts) ──────────────────────
-
-const CREDENTIAL_SUFFIXES: string[] = [
-  '_API_KEY',
-  '_TOKEN',
-  '_SECRET',
-  '_PASSWORD',
-  '_CREDENTIALS',
-  '_ACCESS_KEY',
-  '_PRIVATE_KEY',
-  '_OAUTH_TOKEN',
-]
-
-const CREDENTIAL_NAMES = new Set([
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_TOKEN',
-  'AWS_ACCESS_KEY_ID',
-  'AWS_SECRET_ACCESS_KEY',
-  'AWS_SESSION_TOKEN',
-  'CUSTOM_API_KEY',
-  'GEMINI_BASE_URL',
-  'OPENAI_BASE_URL',
-  'OPENROUTER_BASE_URL',
-  'OLLAMA_BASE_URL',
-  'GROQ_BASE_URL',
-  'XAI_BASE_URL',
-])
-
-function isCredentialEnvVar(name: string): boolean {
-  if (CREDENTIAL_NAMES.has(name)) {
-    return true
-  }
-
-  return CREDENTIAL_SUFFIXES.some((suffix) => name.endsWith(suffix))
-}
-
-function stripCredentials(env: Record<string, string | undefined>): Record<string, string> {
-  const clean: Record<string, string> = {}
-
-  for (const [key, value] of Object.entries(env)) {
-    if (!value) {
-      continue
-    }
-
-    if (isCredentialEnvVar(key)) {
-      continue
-    }
-
-    clean[key] = value
-  }
-
-  return clean
-}
 
 // ─── Sandbox creation ──────────────────────────────────────────────────
 
@@ -221,35 +169,7 @@ function writeEmptyConfig(hermesHome: string): void {
  *  - XDG_RUNTIME_DIR → ensure Electron has a writable runtime dir on Linux
  */
 export function buildAppEnv(sandbox: Sandbox, extra: Record<string, string> = {}): Record<string, string> {
-  const clean = stripCredentials(process.env)
-
-  // XDG_RUNTIME_DIR is needed for Electron on Linux when running in a
-  // headless/CI context — without it the zygote may fail to initialize.
-  if (!clean.XDG_RUNTIME_DIR && process.env.XDG_RUNTIME_DIR) {
-    clean.XDG_RUNTIME_DIR = process.env.XDG_RUNTIME_DIR
-  }
-
-  // DISPLAY — needed for Electron to open a window.
-  if (!clean.DISPLAY && process.env.DISPLAY) {
-    clean.DISPLAY = process.env.DISPLAY
-  }
-
-  return {
-    ...clean,
-    HERMES_HOME: sandbox.hermesHome,
-    HERMES_DESKTOP_USER_DATA_DIR: sandbox.userDataDir,
-    HERMES_DESKTOP_IGNORE_EXISTING: '1',
-    HERMES_DESKTOP_HERMES_ROOT: REPO_ROOT,
-    HERMES_DESKTOP_APP_NAME: `HermesE2E-${Date.now()}`,
-    // `app.close()` in teardown must exit even when a spec leaves a turn
-    // mid-flight — otherwise the quit confirmation waits on a click that no
-    // one is there to make, and the worker dies on a teardown timeout.
-    HERMES_DESKTOP_SKIP_QUIT_CONFIRM: '1',
-    // Clear dev-server override — we want the built dist/, not a vite server.
-    // The dev-server check in main.ts looks for this env var; if it's set,
-    // it loads from the vite URL instead of the local file.
-    ...extra,
-  }
+  return isolatedDesktopEnv(sandbox, REPO_ROOT, process.env, extra)
 }
 
 // ─── Electron launch ────────────────────────────────────────────────────
@@ -284,27 +204,19 @@ function assertDistBuilt(): void {
  * As a fallback, use the node_modules/.bin/electron from the desktop package.
  */
 export function findElectron(): string {
-  // In dev mode, we use the `electron` binary directly (not the packaged app).
-  // The dev:electron script in package.json does exactly this: `electron .`
-  // after building. We replicate that here.
-  const localElectron = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron')
-
-  if (fs.existsSync(localElectron)) {
-    return localElectron
+  // electron's package entry resolves Electron.app/Contents/MacOS/Electron,
+  // electron.exe, or electron from the installed lockfile on this platform.
+  try {
+    const executable = createRequire(import.meta.url)('electron') as string
+    if (fs.existsSync(executable)) return executable
+  } catch {
+    // The Nix development shell can supply Electron without the npm download.
   }
-
-  // Fall back to PATH
-  const result = spawnSync('which', ['electron'], {
-    encoding: 'utf8',
-  })
-
-  if (result.status === 0 && result.stdout.trim()) {
-    return result.stdout.trim()
+  if (!process.env.CI) {
+    const result = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['electron'], { encoding: 'utf8' })
+    if (result.status === 0 && result.stdout.trim()) return result.stdout.trim().split('\n')[0]!
   }
-
-  throw new Error(
-    'Electron binary not found. Run "npm install" from the repo root to install devDependencies.',
-  )
+  throw new Error('Install the pinned Electron binary before desktop quality checks.')
 }
 
 /**
@@ -334,13 +246,16 @@ export async function launchDesktop(
     cwd: DESKTOP_ROOT,
   })
 
-  const page = await app.firstWindow()
-
-  // Install the error-banner guard so any [role="alert"] that appears
-  // during a test is collected and surfaced in afterEach.
-  installErrorBannerGuard(page)
-
-  return { app, page }
+  try {
+    const page = await app.firstWindow()
+    await page.waitForURL(url => url.protocol === 'file:' && url.pathname.endsWith('/index.html'))
+    await page.waitForLoadState('domcontentloaded')
+    installErrorBannerGuard(page)
+    return { app, page }
+  } catch (error) {
+    await app.close().catch(() => undefined)
+    throw error
+  }
 }
 
 // ─── Public fixtures ────────────────────────────────────────────────────
@@ -395,7 +310,11 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
 
   // 3. Build env + launch
   const env = buildAppEnv(sandbox)
-  const { app, page } = await launchDesktop(env)
+  const { app, page } = await launchDesktop(env).catch(async error => {
+    await mock.close()
+    sandbox.cleanup()
+    throw error
+  })
 
   return {
     app,
@@ -427,7 +346,10 @@ export async function setupNoProvider(): Promise<NoProviderFixture> {
   writeEmptyConfig(sandbox.hermesHome)
 
   const env = buildAppEnv(sandbox)
-  const { app, page } = await launchDesktop(env)
+  const { app, page } = await launchDesktop(env).catch(async error => {
+    sandbox.cleanup()
+    throw error
+  })
 
   return {
     app,
@@ -488,7 +410,10 @@ providers:
   writeEnvFile(sandbox.hermesHome)
 
   const env = buildAppEnv(sandbox, options.fakeError ? { HERMES_DESKTOP_BOOT_FAKE_ERROR: 'Failed to connect to Hermes backend: connection refused' } : {})
-  const { app, page } = await launchDesktop(env)
+  const { app, page } = await launchDesktop(env).catch(async error => {
+    sandbox.cleanup()
+    throw error
+  })
 
   return {
     app,
@@ -571,6 +496,7 @@ export async function setupPackagedApp(): Promise<PackagedAppFixture> {
     executablePath: PACKAGED_BINARY_PATH,
     args: ['--disable-gpu', '--no-sandbox'],
     env,
+    cwd: DESKTOP_ROOT,
   })
 
   const page = await app.firstWindow()

@@ -1,0 +1,418 @@
+{
+  "schema_version": 1,
+  "repository": "Extra-Medium-Human/hermes-agent",
+  "default_branch": "main",
+  "runtimes": {
+    "python": "3.12.10",
+    "node": "22.23.1",
+    "npm": "10.9.8",
+    "uv": "0.12.9"
+  },
+  "bootstrap": [
+    "python3 scripts/quality/bootstrap.py"
+  ],
+  "components": {
+    "core": {
+      "paths": [
+        "agent/**",
+        "tools/**",
+        "providers/**",
+        "run_agent.py",
+        "model_tools.py",
+        "toolsets.py",
+        "toolset_distributions.py",
+        "batch_runner.py",
+        "trajectory_compressor.py",
+        "hermes_*.py",
+        "utils.py",
+        "tests/agent/**",
+        "tests/run_agent/**",
+        "tests/tools/**",
+        "tests/hermes_state/**",
+        "tests/state/**",
+        "tests/test_*.py"
+      ],
+      "depends_on": [],
+      "checks": [
+        "python-runtime",
+        "python-static",
+        "python-affected"
+      ],
+      "critical_behaviors": [
+        "Isolate configuration, sessions, state, credentials, and profile-scoped runtime discovery."
+      ]
+    },
+    "runtime": {
+      "paths": [
+        "hermes_cli/**",
+        "cli.py",
+        "scripts/install*",
+        "scripts/desktop-update/**",
+        "tests/hermes_cli/**",
+        "tests/cli/**"
+      ],
+      "depends_on": [
+        "core"
+      ],
+      "checks": [
+        "python-runtime",
+        "python-static",
+        "python-affected"
+      ],
+      "critical_behaviors": [
+        "Update locking and archive path rejection preserve the installed runtime and user state."
+      ]
+    },
+    "gateway": {
+      "paths": [
+        "gateway/**",
+        "tui_gateway/**",
+        "cron/**",
+        "acp_adapter/**",
+        "tests/gateway/**",
+        "tests/tui_gateway/**",
+        "tests/cron/**",
+        "tests/acp_adapter/**"
+      ],
+      "depends_on": [
+        "core",
+        "runtime"
+      ],
+      "checks": [
+        "python-runtime",
+        "python-static",
+        "python-affected"
+      ],
+      "critical_behaviors": [
+        "Loopback binding, session boundary isolation, and workspace routing remain correct."
+      ]
+    },
+    "extensions": {
+      "paths": [
+        "plugins/**",
+        "skills/**",
+        "optional-skills/**",
+        "optional-mcps/**",
+        "tests/plugins/**",
+        "tests/skills/**"
+      ],
+      "depends_on": [
+        "core"
+      ],
+      "checks": [
+        "python-runtime",
+        "python-static",
+        "python-affected"
+      ],
+      "critical_behaviors": [
+        "Extensions retain credential and profile boundaries; skill prose remains runtime input."
+      ]
+    },
+    "shared": {
+      "paths": [
+        "apps/shared/**"
+      ],
+      "depends_on": [],
+      "checks": [
+        "shared-static"
+      ],
+      "critical_behaviors": [
+        "Shared gateway and billing contracts typecheck for every UI consumer."
+      ]
+    },
+    "desktop": {
+      "paths": [
+        "apps/desktop/**"
+      ],
+      "depends_on": [
+        "gateway",
+        "shared"
+      ],
+      "checks": [
+        "desktop-unit",
+        "desktop-ui-critical",
+        "desktop-static",
+        "desktop-boot-chat",
+        "desktop-full"
+      ],
+      "critical_behaviors": [
+        "Desktop boots, reaches its isolated local backend, renders a mocked turn, and reports startup failures without user state or permission changes."
+      ]
+    },
+    "tui": {
+      "paths": [
+        "ui-tui/**"
+      ],
+      "depends_on": [
+        "gateway",
+        "shared"
+      ],
+      "checks": [
+        "tui"
+      ],
+      "critical_behaviors": [
+        "TUI build and tests preserve session identity and streamed turn behavior."
+      ]
+    },
+    "web": {
+      "paths": [
+        "web/**"
+      ],
+      "depends_on": [
+        "gateway",
+        "shared"
+      ],
+      "checks": [
+        "web"
+      ],
+      "critical_behaviors": [
+        "Dashboard runtime and shared gateway adapters preserve scoped sessions."
+      ]
+    },
+    "verification": {
+      "paths": [
+        "tests-js/**",
+        "scripts/quality/**",
+        "scripts/ci/**",
+        "scripts/run_tests*",
+        "tests/ci/**",
+        "tests/scripts/**"
+      ],
+      "depends_on": [],
+      "checks": [
+        "root-js",
+        "python-runtime",
+        "python-full-1",
+        "python-full-2",
+        "python-full-3",
+        "python-full-4",
+        "python-full-5",
+        "python-full-6",
+        "python-full-7",
+        "python-full-8",
+        "python-affected"
+      ],
+      "critical_behaviors": [
+        "Unknown, failed, cancelled, and missing validation cannot be reported as passing."
+      ]
+    }
+  },
+  "checks": {
+    "prose": {
+      "command": "python3 scripts/quality/run.py python3 scripts/quality/docs.py",
+      "timeout": 60,
+      "kind": "docs",
+      "runner": "ubuntu-24.04"
+    },
+    "python-runtime": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 tests/hermes_cli/test_profiles.py tests/hermes_cli/test_update_lock.py tests/hermes_cli/test_update_zip_symlink_reject.py tests/gateway/test_session_boundary_security_state.py tests/gateway/test_api_server_bind_guard.py tests/tui_gateway/test_session_cwd_follow.py tests/scripts/test_quality_isolation.py",
+      "timeout": 900,
+      "kind": "critical",
+      "runner": "ubuntu-24.04",
+      "inputs": [
+        "tests/hermes_cli/test_profiles.py",
+        "tests/hermes_cli/test_update_lock.py",
+        "tests/hermes_cli/test_update_zip_symlink_reject.py",
+        "tests/gateway/test_session_boundary_security_state.py",
+        "tests/gateway/test_api_server_bind_guard.py",
+        "tests/tui_gateway/test_session_cwd_follow.py",
+        "tests/scripts/test_quality_isolation.py"
+      ]
+    },
+    "python-static": {
+      "command": "python3 scripts/quality/run.py .venv/bin/ruff check .",
+      "timeout": 900,
+      "kind": "static",
+      "runner": "ubuntu-24.04"
+    },
+    "desktop-unit": {
+      "command": "python3 scripts/quality/run.py npm exec --workspace apps/desktop -- vitest run --project electron electron/e2e-sandbox-env.test.ts electron/backend-command.test.ts electron/desktop-installation.test.ts electron/desktop-uninstall.test.ts",
+      "timeout": 900,
+      "kind": "critical",
+      "runner": "macos-15"
+    },
+    "desktop-ui-critical": {
+      "command": "python3 scripts/quality/run.py npm exec --workspace apps/desktop -- vitest run --project ui src/components/boot-failure-overlay.test.tsx src/lib/desktop-remote-auth.test.ts src/lib/desktop-slash-commands.test.ts",
+      "timeout": 900,
+      "kind": "critical",
+      "runner": "macos-15"
+    },
+    "desktop-static": {
+      "command": "python3 scripts/quality/run.py npm run typecheck --workspace apps/desktop",
+      "timeout": 900,
+      "kind": "static",
+      "runner": "macos-15"
+    },
+    "desktop-build": {
+      "command": "python3 scripts/quality/run.py npm run build --workspace apps/desktop",
+      "timeout": 900,
+      "kind": "build",
+      "runner": "macos-15"
+    },
+    "desktop-boot-chat": {
+      "command": "python3 scripts/quality/run.py npm exec --workspace apps/desktop -- playwright test --config playwright.quality.config.ts",
+      "timeout": 600,
+      "kind": "critical",
+      "runner": "macos-15",
+      "inputs": [
+        "apps/desktop/e2e/quality-smoke.spec.ts",
+        "apps/desktop/e2e/fixtures.ts",
+        "apps/desktop/e2e/sandbox-env.ts",
+        "apps/desktop/e2e/mock-server.ts"
+      ],
+      "depends_on": [
+        "desktop-build"
+      ]
+    },
+    "desktop-full": {
+      "command": "python3 scripts/quality/run.py npm run test --workspace apps/desktop",
+      "timeout": 1800,
+      "kind": "full",
+      "runner": "macos-15",
+      "inputs": [
+        "apps/desktop/**/*.test.ts",
+        "apps/desktop/**/*.test.tsx"
+      ]
+    },
+    "shared-static": {
+      "command": "python3 scripts/quality/run.py npm run check --workspace apps/shared",
+      "timeout": 900,
+      "kind": "static",
+      "runner": "ubuntu-24.04"
+    },
+    "root-js": {
+      "command": "python3 scripts/quality/run.py npm run check --workspace tests-js",
+      "timeout": 900,
+      "kind": "critical",
+      "runner": "ubuntu-24.04"
+    },
+    "tui": {
+      "command": "python3 scripts/quality/run.py npm run check --workspace ui-tui",
+      "timeout": 900,
+      "kind": "critical",
+      "runner": "ubuntu-24.04"
+    },
+    "web": {
+      "command": "python3 scripts/quality/run.py npm run check --workspace web",
+      "timeout": 900,
+      "kind": "critical",
+      "runner": "ubuntu-24.04"
+    },
+    "python-full-1": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 1/8 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
+    },
+    "python-full-2": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 2/8 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
+    },
+    "python-full-3": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 3/8 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
+    },
+    "python-full-4": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 4/8 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
+    },
+    "python-full-5": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 5/8 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
+    },
+    "python-full-6": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 6/8 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
+    },
+    "python-full-7": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 7/8 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
+    },
+    "python-full-8": {
+      "command": "python3 scripts/quality/run.py scripts/run_tests.sh -j 4 --file-retries 0 --slice 8/8 -m 'not integration and not ssh'",
+      "timeout": 3600,
+      "kind": "full",
+      "runner": "ubuntu-24.04"
+    },
+    "python-affected": {
+      "command": "python3 scripts/quality/run.py python3 scripts/quality/python_affected.py",
+      "timeout": 3600,
+      "kind": "critical",
+      "runner": "ubuntu-24.04",
+      "inputs": [
+        "tests/**/*.py"
+      ]
+    }
+  },
+  "docs": {
+    "paths": [
+      "README.md",
+      "CHANGELOG.md",
+      "CONTRIBUTING.md",
+      "docs/**/*.md",
+      "website/docs/**/*.md",
+      "website/docs/**/*.mdx"
+    ],
+    "checks": [
+      "prose"
+    ]
+  },
+  "global_inputs": [
+    "pyproject.toml",
+    "uv.lock",
+    "package.json",
+    "package-lock.json",
+    ".npmrc",
+    "eslint.config.*",
+    "scripts/quality/**",
+    "scripts/run_tests*",
+    "tests/conftest.py"
+  ],
+  "ci": {
+    "nightly_minute": 30,
+    "compilation_caches": [
+      ".quality-cache/uv",
+      ".quality-cache/electron"
+    ]
+  },
+  "release": {
+    "kind": "desktop",
+    "persistent_state_paths": [
+      "hermes_state*.py",
+      "hermes_cli/config.py",
+      "hermes_cli/profiles.py",
+      "gateway/session.py",
+      "apps/desktop/electron/desktop-installation.ts"
+    ],
+    "capabilities": {
+      "quality_gate": {
+        "status": "available",
+        "reason": "Fork-owned affected checks and complete offline regression declarations run without production credentials."
+      },
+      "staged_runtime_activation": {
+        "status": "unavailable",
+        "reason": "Installed Hermes and Nous Research release infrastructure are excluded. Fork quality does not install or activate a desktop release."
+      },
+      "state_compatible_recovery": {
+        "status": "unavailable",
+        "reason": "No installed bundle was changed; automatic recovery must be validated for an explicitly selected distribution target."
+      },
+      "paid_provider_evaluation": {
+        "status": "not_applicable",
+        "reason": "Ordinary quality uses local mock inference and excludes integration, SSH, container and live-provider suites."
+      }
+    }
+  }
+}

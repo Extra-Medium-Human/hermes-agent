@@ -15,6 +15,6 @@
     "declaration": true,
     "outDir": "build/electron-types"
   },
-  "include": ["electron"],
+  "include": ["electron", "e2e/sandbox-env.ts"],
   "exclude": ["src"]
 }
