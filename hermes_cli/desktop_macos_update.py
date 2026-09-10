@@ -512,7 +512,16 @@ def stop_owned(owned):
             continue
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        if all(process_record(lib, pid) is None for pid in owned):
+        all_exited = True
+        for pid in owned:
+            try:
+                current = process_record(lib, pid)
+            except RuntimeError:
+                all_exited = False
+                continue
+            if current is not None:
+                all_exited = False
+        if all_exited:
             return
         time.sleep(0.5)
     raise RuntimeError("candidate processes did not exit within 30 seconds")

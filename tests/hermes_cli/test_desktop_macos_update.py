@@ -738,6 +738,30 @@ def test_native_main_death_during_stability_is_not_adoption(bundles, monkeypatch
         stop_fixture(target)
 
 
+def test_stop_owned_retries_uninspectable_identity_until_confirmed_exit(monkeypatch):
+    update = updater()
+    original = update.Process(123, (1, 0), 1, Path("/fixture"))
+    observations = iter([original, RuntimeError("executable identity unavailable"), None])
+    signals = []
+    sleeps = []
+
+    def process_record(*args):
+        observed = next(observations)
+        if isinstance(observed, Exception):
+            raise observed
+        return observed
+
+    monkeypatch.setattr(update, "native", object)
+    monkeypatch.setattr(update, "process_record", process_record)
+    monkeypatch.setattr(update.os, "kill", lambda *args: signals.append(args))
+    monkeypatch.setattr(update.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    update.stop_owned({original.pid: original})
+
+    assert signals == [(original.pid, update.signal.SIGTERM)]
+    assert sleeps == [0.5]
+
+
 @pytest.mark.parametrize("damage", ["permission", "short", "zero", "repeated-guard", "pid-reuse"])
 def test_mapped_scan_rejects_incomplete_or_unstable_records(monkeypatch, damage):
     import ctypes
