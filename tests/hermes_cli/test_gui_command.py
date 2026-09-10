@@ -151,7 +151,7 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
          patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
          patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main_desktop._write_desktop_build_stamp"), \
-         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True), \
          patch("hermes_cli.main_desktop._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.main_desktop._register_linux_desktop_entry"), \
          patch("hermes_cli.main.subprocess.run", side_effect=_pack_into_staging(root)) as mock_run, \
@@ -174,12 +174,13 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     assert staging.parent == desktop_dir and staging.name.startswith(".staging-")
     assert not staging.exists()  # swapped into release/ and cleaned up
     assert mock_run.call_args_list[0].kwargs["cwd"] == desktop_dir
-    launched = mock_run.call_args_list[1].args[0]
     if sys.platform.startswith("linux"):
-        assert launched == [str(packaged_exe), "--disable-setuid-sandbox"]
+        expected_launch = [str(packaged_exe), "--disable-setuid-sandbox"]
     else:
-        assert launched == [str(packaged_exe)]
-    assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
+        expected_launch = [str(packaged_exe)]
+    launch_calls = [call for call in mock_run.call_args_list if call.args[0] == expected_launch]
+    assert len(launch_calls) == 1
+    assert launch_calls[0].kwargs["cwd"] == desktop_dir
 
 
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
@@ -1098,7 +1099,7 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
     ``ELECTRON_OZONE_PLATFORM_HINT`` on the launched Electron process."""
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
-    _make_packaged_executable(root, monkeypatch)
+    packaged_executable = _make_packaged_executable(root, monkeypatch)
 
     ok = subprocess.CompletedProcess([], 0)
     cfg = {"desktop": {"ozone_platform_hint": "x11"}}
@@ -1107,7 +1108,7 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
          patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=ok), \
          patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main_desktop._write_desktop_build_stamp"), \
-         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True), \
          patch("hermes_cli.main_desktop._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
@@ -1115,7 +1116,11 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
-    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    launch_call = next(
+        call for call in mock_run.call_args_list
+        if call.args[0][0] == str(packaged_executable)
+    )
+    launch_env = launch_call.kwargs["env"]
     assert launch_env.get("ELECTRON_OZONE_PLATFORM_HINT") == "x11"
 
     monkeypatch.setenv("ELECTRON_OZONE_PLATFORM_HINT", "wayland")
@@ -1123,7 +1128,7 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
          patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=ok), \
          patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main_desktop._write_desktop_build_stamp"), \
-         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True), \
          patch("hermes_cli.main_desktop._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
@@ -1131,7 +1136,11 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
-    launch_env = mock_run2.call_args_list[1].kwargs["env"]
+    launch_call = next(
+        call for call in mock_run2.call_args_list
+        if call.args[0][0] == str(packaged_executable)
+    )
+    launch_env = launch_call.kwargs["env"]
     assert launch_env.get("ELECTRON_OZONE_PLATFORM_HINT") == "wayland"
 
 
@@ -1303,7 +1312,7 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
     _clear_keychain_env(monkeypatch)
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
-    _make_packaged_executable(root, monkeypatch)
+    packaged_executable = _make_packaged_executable(root, monkeypatch)
 
     ok = subprocess.CompletedProcess([], 0)
 
@@ -1311,7 +1320,7 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
          patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=ok), \
          patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main_desktop._write_desktop_build_stamp"), \
-         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value={}), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
          patch("hermes_cli.main_desktop._detect_linux_password_store") as mock_detect, \
@@ -1320,7 +1329,11 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
         cli_main.cmd_gui(_ns())
 
     mock_detect.assert_not_called()
-    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    launch_call = next(
+        call for call in mock_run.call_args_list
+        if call.args[0][0] == str(packaged_executable)
+    )
+    launch_env = launch_call.kwargs["env"]
     assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
 
 
@@ -1339,7 +1352,7 @@ def _gui_build_patches(root: Path, run_side_effect):
               return_value=subprocess.CompletedProcess(["npm", "ci"], 0)),
         patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True),
         patch("hermes_cli.main_desktop._write_desktop_build_stamp"),
-        patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup"),
+        patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True),
         patch("hermes_cli.main_desktop._register_linux_desktop_entry"),
         patch("hermes_cli.main_desktop._stop_desktop_processes_locking_build", return_value=[]),
         patch("hermes_cli.main_desktop._purge_electron_build_cache", return_value=[]),

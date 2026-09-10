@@ -886,9 +886,12 @@ def _desktop_macos_relaunchable_fixup(
         if identity != "-":
             print(
                 f"  (warning: configured macOS signing identity failed: {identity!r}; "
-                "falling back to ad-hoc — TCC grants may need to be re-granted)"
+                "refusing to replace it with an ad-hoc identity)"
             )
+            return False
         print(f"  (warning: stable macOS signing failed ({exc}); using legacy ad-hoc sign)")
+    if identity != "-":
+        return False
     return _macos_legacy_adhoc_resign(codesign, app)
 
 
@@ -1327,19 +1330,34 @@ def _run_desktop_pack_with_recovery(
 def _promote_staged_desktop_app(desktop_dir: Path, staging_dir: Path) -> Path:
     """Sign + integrity-gate the STAGED pack, then swap it over the live app. Exits (live app kept) on failure."""
     staged_executable = _desktop_packaged_executable_in(staging_dir)
+    if staged_executable is None:
+        _discard_desktop_staging(staging_dir)
+        print(f"✗ Desktop build produced no launchable app in {staging_dir}")
+        print(_PREVIOUS_APP_KEPT)
+        sys.exit(1)
     # Locally-built apps are ad-hoc signed; make them relaunchable after an
     # in-place self-update. Signs the STAGED bundle so the live app is never
     # half-signed. No-op on non-macOS and on real-identity builds.
-    _desktop_macos_relaunchable_fixup(desktop_dir, release_dir=staging_dir)
+    signing_ok = _desktop_macos_relaunchable_fixup(desktop_dir, release_dir=staging_dir)
+    if sys.platform == "darwin":
+        try:
+            signing_ok = signing_ok and _codesign_verify(
+                "/usr/bin/codesign", staged_executable.parents[2], check=False, timeout=30
+            ).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            signing_ok = False
+    if not signing_ok:
+        _discard_desktop_staging(staging_dir)
+        print("✗ Desktop signing or independent signature verification failed.")
+        print(_PREVIOUS_APP_KEPT)
+        sys.exit(1)
 
     # Windows integrity gate: never declare the rebuild a success on a
     # Hermes.exe Windows cannot load. Verified on the STAGED exe, so a failure
     # simply discards staging and fails loudly for the updater's retry-once.
     verified_executable, rolled_back = _ensure_desktop_exe_launchable(desktop_dir, staged_executable)
-    if staged_executable is None or rolled_back or verified_executable is None:
+    if rolled_back or verified_executable is None:
         _discard_desktop_staging(staging_dir)
-        if staged_executable is None:
-            print(f"✗ Desktop build produced no launchable app in {staging_dir}")
         print(_PREVIOUS_APP_KEPT)
         sys.exit(1)
     packaged_executable = _swap_staged_desktop_app(desktop_dir, staging_dir)
