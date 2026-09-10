@@ -52,8 +52,8 @@ permissions:
 
 jobs:
   scan:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: Scan PR for critical supply chain risks
-    if: inputs.scan
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -178,8 +178,8 @@ jobs:
 
 
   dep-bounds:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: Check PyPI dependency upper bounds
-    if: inputs.deps
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -256,9 +256,9 @@ jobs:
           exit 1
 
   aggregate:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: Aggregate review statuses
     needs: [scan, dep-bounds]
-    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:

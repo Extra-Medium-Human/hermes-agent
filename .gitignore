@@ -198,3 +198,9 @@ native/fts5_cjk/*.so
 # Fork quality caches and generated evidence
 .quality-cache/
 .quality-results/
+
+.quality-checks/
+.quality-history/
+.quality-release-history/
+.quality-release/
+.quality/__pycache__/

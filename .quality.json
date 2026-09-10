@@ -381,11 +381,8 @@
     "tests/conftest.py"
   ],
   "ci": {
-    "nightly_minute": 30,
-    "compilation_caches": [
-      ".quality-cache/uv",
-      ".quality-cache/electron"
-    ]
+    "nightly_minute": 20,
+    "compilation_caches": []
   },
   "release": {
     "kind": "desktop",

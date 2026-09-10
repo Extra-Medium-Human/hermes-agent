@@ -17,8 +17,8 @@ permissions:
 
 jobs:
   build-index:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     # Only run on the upstream repository, not on forks
-    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: trusted-automation
@@ -57,8 +57,8 @@ jobs:
   # The deploy itself is owned by deploy-site.yml (which crawls and deploys
   # everything in one pipeline); we just kick it on a schedule.
   trigger-deploy:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     needs: build-index
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: trusted-automation

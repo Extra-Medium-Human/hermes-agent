@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/deathxdefeat/repository-operations/quality-v1",
+  "title": "Repository Quality Adapter v1",
+  "type": "object",
+  "required": ["schema_version", "repository", "default_branch", "runtimes", "bootstrap", "components", "checks", "docs", "release"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "default_branch": {"type": "string", "minLength": 1},
+    "runtimes": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([-+][A-Za-z0-9.-]+)?$"}},
+    "bootstrap": {"$ref": "#/$defs/strings"},
+    "bootstrap_env": {"$ref": "#/$defs/env"},
+    "global_inputs": {"$ref": "#/$defs/strings"},
+    "trusted_workflows": {"$ref": "#/$defs/strings"},
+    "components": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/component"}},
+    "checks": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/check"}},
+    "docs": {"type": "object", "properties": {"paths": {"$ref": "#/$defs/strings"}, "checks": {"$ref": "#/$defs/strings"}}},
+    "release": {"type": "object", "required": ["kind"], "properties": {"kind": {"enum": ["none", "vercel", "fly", "desktop", "package"]}, "capabilities": {"type": "object", "additionalProperties": {"type": "object", "required": ["status", "reason"], "properties": {"status": {"enum": ["available", "unavailable", "not_applicable"]}, "reason": {"type": "string", "minLength": 1}}}}}}
+  },
+  "$defs": {
+    "strings": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "env": {"type": "object", "propertyNames": {"pattern": "^[A-Z_][A-Z0-9_]*$"}, "additionalProperties": {"type": "string"}},
+    "component": {"type": "object", "required": ["paths", "checks", "critical_behaviors"], "properties": {"paths": {"allOf": [{"$ref": "#/$defs/strings"}, {"minItems": 1}]}, "checks": {"allOf": [{"$ref": "#/$defs/strings"}, {"minItems": 1}]}, "depends_on": {"$ref": "#/$defs/strings"}, "critical_behaviors": {"allOf": [{"$ref": "#/$defs/strings"}, {"minItems": 1}]}}},
+    "check": {"type": "object", "required": ["command", "timeout", "kind", "runner"], "properties": {"command": {"type": "string", "minLength": 1}, "timeout": {"type": "integer", "minimum": 1, "maximum": 21600}, "kind": {"enum": ["critical", "static", "build", "docs", "full"]}, "runner": {"enum": ["ubuntu-24.04", "macos-15"]}, "inputs": {"$ref": "#/$defs/strings"}, "depends_on": {"$ref": "#/$defs/strings"}, "env": {"$ref": "#/$defs/env"}}}
+  }
+}

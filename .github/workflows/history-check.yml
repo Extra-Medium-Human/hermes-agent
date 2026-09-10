@@ -25,6 +25,7 @@ permissions:
 
 jobs:
   check-common-ancestor:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:

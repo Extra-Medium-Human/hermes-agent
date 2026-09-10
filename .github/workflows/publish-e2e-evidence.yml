@@ -19,8 +19,8 @@ concurrency:
 
 jobs:
   publish:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: Publish inline E2E evidence
-    if: github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: gh-image

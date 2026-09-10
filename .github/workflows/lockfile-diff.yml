@@ -33,6 +33,7 @@ concurrency:
 
 jobs:
   diff:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: package-lock.json semantic diff
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -6,6 +6,7 @@ on:
 
 jobs:
   workspaces:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: List npm workspaces
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -54,6 +55,7 @@ jobs:
           ' >> "$GITHUB_OUTPUT"
 
   check:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: ${{ matrix.package }} / ${{ matrix.script }}
     needs: workspaces
     runs-on: ubuntu-latest

@@ -28,8 +28,8 @@ concurrency:
 
 jobs:
   lint-diff:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: ruff + ty diff
-    if: inputs.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -119,6 +119,7 @@ jobs:
           cat .lint-reports/summary.md >> "$GITHUB_STEP_SUMMARY"
 
   ruff-blocking:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     # Enforce the rules in pyproject.toml [tool.ruff.lint.select]. Currently
     # PLW1514 (unspecified-encoding) — catches bare ``open()`` /
     # ``read_text()`` / ``write_text()`` calls that default to locale
@@ -152,6 +153,7 @@ jobs:
           ruff check .
 
   windows-footguns:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     # Static guardrails on Windows-unsafe Python primitives — os.kill(pid, 0),
     # os.killpg, os.setsid, signal.SIGKILL without getattr fallback,
     # shebang scripts via subprocess, bare open() without encoding=, etc.

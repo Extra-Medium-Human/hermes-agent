@@ -59,6 +59,7 @@ concurrency:
 
 jobs:
   check:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: uv lock --check
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -24,8 +24,8 @@ concurrency:
 
 jobs:
   rerun-review-labels:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: Rerun review-labels job
-    if: github.event.label.name == 'ci-reviewed'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:

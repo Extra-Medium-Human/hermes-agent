@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   e2e:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: Playwright E2E (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 20

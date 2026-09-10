@@ -28,6 +28,7 @@ permissions:
 
 jobs:
   check-no-committed-infographics:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:

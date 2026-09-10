@@ -49,8 +49,8 @@ permissions:
 
 jobs:
   check:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     name: Review label gate
-    if: inputs.ci_review || inputs.mcp_catalog || inputs.supply_chain
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:

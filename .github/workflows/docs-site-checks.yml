@@ -8,6 +8,7 @@ permissions:
 
 jobs:
   docs-site-checks:
+    if: ${{ false }} # Inherited upstream job; the fork uses Quality.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
