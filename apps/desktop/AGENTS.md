@@ -18,6 +18,10 @@ OAuth reconnects mint a fresh WebSocket ticket on every dial. Only confirmed 401
 
 Agent-callable Desktop tools use the session source (`source: 'desktop'`), including remote/cloud gateways. Keep compatibility tied to identified older-runtime capability. Keep hot interactions narrowly subscribed, coalesce cosmetic updates, and publish terminal turn transitions promptly.
 
+## Nous free tier
+
+Free-tier state is pulled from the backend and never latched in the renderer. `free_tier.status` reads local auth state without network access; `free_tier.ack_notice` persists the one-time notice on the identity. The ready screen and own-key strip render the same `notice_pending` state. Sign-in uses the existing Nous OAuth start/poll path, and every entry point opens the same sign-in dialog. Branch on explicit `free_tier_row` / `free_tier` payload fields, never provider display names.
+
 ## Focused references and commands
 
 - Backend lifecycle, slash palette and Bot Mode: [src/AGENTS.md](src/AGENTS.md).
