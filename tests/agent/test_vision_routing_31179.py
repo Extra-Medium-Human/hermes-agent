@@ -180,6 +180,17 @@ model:
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
 
+        # The routing contract needs known capability data. A pristine CI
+        # home has no models.dev cache and unknown capabilities deliberately
+        # remain permissive, so supply the catalog fixture at its boundary.
+        from types import SimpleNamespace
+        from agent import models_dev
+        monkeypatch.setattr(
+            models_dev, "get_model_capabilities",
+            lambda provider, model: SimpleNamespace(supports_vision=False)
+            if provider == "deepseek" else None,
+        )
+
         from agent.auxiliary_client import resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
         assert client is None, (

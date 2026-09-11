@@ -1,0 +1,13 @@
+{
+  "files": {
+    ".quality/ci.py": "bdff6a13c92a0db9ba70ee75f37d36a832336835498bd5cb10e4ec5da22bd354",
+    ".quality/quality.py": "b3c74fb8ad6920c27ad5aa63a0345fb95e4a9e63236ee23f453432b94a0380aa",
+    ".quality/release.py": "9fdaaa4899e8fb351ac0addc2dd14ac4efb62a3b2bcb762990a894d50f3e2458",
+    ".quality/schema.json": "74b74865abf357e6364cd02c09852409eb1d0d0ab897b926e4fbbe50d651c14d",
+    ".quality/vendor.py": "1d03b70b0a81f97987ba47ddc46e9fd6c3dd68fcbadfcc7ae5dd98c9738431ab",
+    ".quality/workflow.py": "04685d7a8c6034cf17278f9f78d045a5b113a0f8bbbbed82145336ba5d56539f"
+  },
+  "revision": "5c04528ac54019d5a0473de7fd0bbc0481451e14",
+  "schema_version": 1,
+  "source": "deathxdefeat/repository-operations"
+}

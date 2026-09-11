@@ -49,6 +49,7 @@ _EXEMPT_DIRS = (
     "node_modules",
     ".git",
     ".venv",
+    ".quality-cache",  # Downloaded third-party packages, not Hermes source.
     "venv",
     ".worktrees",
 )

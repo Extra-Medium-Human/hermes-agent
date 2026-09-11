@@ -690,7 +690,8 @@ def _sudo_stdin_block_result(description: str) -> dict:
 # =========================================================================
 
 DANGEROUS_PATTERNS = [
-    (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
+    # Home-prefix normalization must retain the absolute-path deletion guard.
+    (r'\brm\s+(-[^\s]*\s+)*(?:/|~/)', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
     # GNU rm permutes options, so a recursive flag group may legally FOLLOW
@@ -971,8 +972,9 @@ for _pattern, _description in DANGEROUS_PATTERNS:
     _PATTERN_KEY_ALIASES.setdefault(_canonical_key, set()).update({_canonical_key, _legacy_key})
     _PATTERN_KEY_ALIASES.setdefault(_legacy_key, set()).update({_legacy_key, _canonical_key})
 
-# Preserve approvals stored under the removed interpreter regex rules.
+# Preserve approvals stored under earlier regex spellings of these rules.
 _REMOVED_PATTERN_KEY_ALIASES = {
+    "delete in root path": r"rm\s+(-[^\s]*\s+)*/",
     "script execution via -e/-c flag": "(python[23]?|perl|ruby|node)\\s+-[ec]\\s+",
     "script execution via heredoc": "(python[23]?|perl|ruby|node)\\s+<<",
 }

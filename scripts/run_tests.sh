@@ -108,6 +108,13 @@ if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
 fi
 
 
+# The fork's quality adapter supplies a fixed, repository-owned socket guard.
+# Ordinary developer tests keep the existing behavior; the adapter never reads
+# the operator's live gateway plugin because its HOME is disposable.
+if [ "${HERMES_QUALITY_OFFLINE:-}" = "1" ]; then
+  EXTRA_PYTHONPATH="$REPO_ROOT/scripts/quality/offline${EXTRA_PYTHONPATH:+:$EXTRA_PYTHONPATH}"
+fi
+
 # ── Windows location variables (computed before we drop env) ───────────────
 # `env -i` forwards HOME, which is enough on POSIX. Native Windows CPython
 # resolves Path.home() from USERPROFILE (or HOMEDRIVE+HOMEPATH), stdlib

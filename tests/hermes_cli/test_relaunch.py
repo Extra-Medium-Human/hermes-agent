@@ -99,6 +99,12 @@ class TestBuildRelaunchArgv:
 
 
 class TestRelaunch:
+    @pytest.fixture(autouse=True)
+    def _process_arguments(self, monkeypatch):
+        # These tests assert dispatch, not inheritance of pytest's -m filter
+        # as Hermes' model option. Inheritance has its own explicit fixtures.
+        monkeypatch.setattr(sys, "argv", ["hermes"])
+
     def test_calls_execvp(self, monkeypatch):
         calls = []
 

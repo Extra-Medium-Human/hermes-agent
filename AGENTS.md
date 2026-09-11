@@ -210,6 +210,17 @@ backends, providers, notifiers), don't merge them one at a time — design an
 ABC + orchestrator, wrap the existing built-in as the first provider, and turn
 the competing PRs into plugins against that interface.
 
+## Quality policy for Extra-Medium-Human/hermes-agent
+
+This user fork uses `.quality.json` and the pinned `Quality` workflow described
+in [docs/FORK_QUALITY.md](docs/FORK_QUALITY.md). The implementing agent owns
+focused self-review; unchanged passing evidence is reusable. Upstream review
+labels, receipts, mandatory independent review and infographics are not fork
+merge gates. Only fork-owned checks are activated here; Nous Research publishing
+and automation are outside this repository's quality rollout. Never run an
+installed-app updater, paid evaluation, permission setup or live provider test
+as an ordinary check.
+
 ## Development Environment
 
 ```bash

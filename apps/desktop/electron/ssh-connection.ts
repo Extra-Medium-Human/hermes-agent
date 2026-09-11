@@ -115,8 +115,9 @@ function redactSecrets(text) {
 // per-user `/var/folders/xx/yyyy…/T/` (~49 bytes), and OpenSSH binds a
 // TEMPORARY listener at `<ControlPath>.<16 random chars>` while establishing
 // the master — so a path that itself fits 104 still overflows at bind time. We
-// root under a short per-user base (`~/.hermes/desktop-ssh`) so even worst case
-// (~72 bytes on macOS) stays clear. Windows has no AF_UNIX sun_path limit.
+// prefer `~/.hermes/desktop-ssh` when it fits. Long or multibyte home names
+// use a short per-user, per-home directory under /tmp. Every public socket
+// operation validates that directory before asking SSH to use it.
 function controlSocketPath(user, host, port, baseDir?, identity: any = {}) {
   const dir = baseDir || defaultControlDir()
   const keyPathIdentity = path.normalize(String(identity.keyPath || ''))
@@ -137,13 +138,24 @@ function controlSocketPath(user, host, port, baseDir?, identity: any = {}) {
 }
 
 function defaultControlDir() {
-  // POSIX: a SHORT, PER-USER base stays under the socket limit AND avoids a
-  // world-shared /tmp dir (no symlink-hijack surface). Created 0700 in open().
+  // Normal homes keep their existing ControlMaster location. The fallback
+  // is one owned 0700 leaf under the sticky system temp directory; its name
+  // includes uid and home identity, and it is never trusted without lstat.
   if (process.platform === 'win32') {
     return path.join(os.tmpdir(), 'hermes-desktop-ssh')
   }
 
-  return path.join(os.homedir(), '.hermes', 'desktop-ssh')
+  const home = os.homedir()
+  const preferred = path.join(home, '.hermes', 'desktop-ssh')
+  const listenerSuffix = '/0123456789abcdef.sock.0123456789abcdef'
+
+  if (Buffer.byteLength(preferred + listenerSuffix) < 104) {
+    return preferred
+  }
+
+  const homeId = crypto.createHash('sha256').update(home).digest('hex').slice(0, 16)
+
+  return path.join('/tmp', `hermes-ssh-${process.getuid!()}-${homeId}`)
 }
 
 // Command construction (pure — the unit tests exercise these directly)
@@ -531,10 +543,48 @@ class SshConnection {
     return err
   }
 
+  // Validate before even the liveness probe: an attacker-controlled mux
+  // socket must never be contacted while deciding whether to reuse it.
+  _ensureControlDir() {
+    if (!this._mux) {
+      return
+    }
+
+    const controlDir = path.dirname(this.controlPath)
+
+    try {
+      fs.mkdirSync(controlDir, { recursive: true, mode: 0o700 })
+    } catch {
+      void 0
+    }
+
+    if (process.platform !== 'win32') {
+      const st = fs.lstatSync(controlDir)
+
+      if (st.isSymbolicLink()) {
+        throw new Error(`Unsafe SSH control dir: ${controlDir} is a symlink.`)
+      }
+
+      if (!st.isDirectory()) {
+        throw new Error(`Unsafe SSH control dir: ${controlDir} is not a directory.`)
+      }
+
+      if (st.uid !== process.getuid!()) {
+        throw new Error(`Unsafe SSH control dir: ${controlDir} is owned by uid ${st.uid}, not ${process.getuid!()}.`)
+      }
+
+      if ((st.mode & 0o777) !== 0o700) {
+        fs.chmodSync(controlDir, 0o700)
+      }
+    }
+  }
+
   // Open the connection. Mux: start the persistent ControlMaster (idempotent —
   // a live master is a no-op). No-mux: there is no master; validate auth +
   // reachability with a one-shot `ssh true` so failures classify identically.
   async open() {
+    this._ensureControlDir()
+
     if (await this.isAlive()) {
       // -O check passing is not proof the master works: a ControlPersist master
       // can survive a failed teardown with wedged channels (observed on macOS
@@ -573,34 +623,6 @@ class SshConnection {
       return
     }
 
-    const controlDir = path.dirname(this.controlPath)
-
-    try {
-      fs.mkdirSync(controlDir, { recursive: true, mode: 0o700 })
-    } catch {
-      void 0
-    }
-
-    if (process.platform !== 'win32') {
-      const st = fs.lstatSync(controlDir)
-
-      if (st.isSymbolicLink()) {
-        throw new Error(`Unsafe SSH control dir: ${controlDir} is a symlink.`)
-      }
-
-      if (!st.isDirectory()) {
-        throw new Error(`Unsafe SSH control dir: ${controlDir} is not a directory.`)
-      }
-
-      if (st.uid !== process.getuid!()) {
-        throw new Error(`Unsafe SSH control dir: ${controlDir} is owned by uid ${st.uid}, not ${process.getuid!()}.`)
-      }
-
-      if ((st.mode & 0o777) !== 0o700) {
-        fs.chmodSync(controlDir, 0o700)
-      }
-    }
-
     const args = buildMasterArgs(this, this._connectTimeoutMs)
     this._logLine(`opening control master to ${target(this.user, this.host)}:${this.port}`)
     let result
@@ -631,6 +653,7 @@ class SshConnection {
       : buildExecArgs(this, 'exit 0', this._connectTimeoutMs)
 
     try {
+      this._ensureControlDir()
       const result: any = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn })
 
       return result.code === 0
@@ -680,6 +703,7 @@ class SshConnection {
   // One-shot remote command over the control connection. Resolves stdout;
   // rejects with a classified error on non-zero exit or timeout.
   async exec(remoteCommand, { timeoutMs, stdinData }: any = {}) {
+    this._ensureControlDir()
     const args = buildExecArgs(this, remoteCommand, this._connectTimeoutMs)
     let result
 
@@ -705,6 +729,7 @@ class SshConnection {
   // the local port accepts. The child dying = tunnel down (isAlive of the
   // backend catches it upstream).
   async forward(localPort, remotePort, remoteHost = '127.0.0.1') {
+    this._ensureControlDir()
     const spec = forwardSpec(localPort, remotePort, remoteHost)
     this._logLine(`forwarding 127.0.0.1:${localPort} -> ${remoteHost}:${remotePort}`)
 
@@ -820,6 +845,7 @@ class SshConnection {
     const args = buildControlArgs(this, 'cancel', ['-L', spec], this._connectTimeoutMs)
 
     try {
+      this._ensureControlDir()
       await runSsh(args, { timeoutMs: this._forwardTimeoutMs, spawnFn: this._spawnFn })
       this._logLine(`cancelled forward 127.0.0.1:${localPort}`)
     } catch (error: any) {
@@ -842,6 +868,15 @@ class SshConnection {
 
       this._opened = false
       this._logLine('connection closed (no-mux tunnels killed)')
+
+      return
+    }
+
+    try {
+      this._ensureControlDir()
+    } catch (error: any) {
+      this._opened = false
+      this._logLine(`close refused unsafe control directory: ${error.message}`)
 
       return
     }
