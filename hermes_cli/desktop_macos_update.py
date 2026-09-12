@@ -363,6 +363,84 @@ def launch_app(app):
     command("/usr/bin/open", app)
 
 
+def _visible_paths(root):
+    home = Path(root).parent
+    return (
+        home / ".hermes-update-visible-request.json",
+        home / ".hermes-update-visible-receipt.json",
+    )
+
+
+def write_visible_request(root, nonce, authority, expected, hashes):
+    """Publish the one-shot reveal contract before LaunchServices starts the app."""
+    request_path, receipt_path = _visible_paths(root)
+    try:
+        receipt_path.unlink()
+    except FileNotFoundError:
+        pass
+    payload = dict(
+        schema_version=1,
+        nonce=nonce,
+        authority=authority,
+        expected_commit=expected["sha"],
+        stamp_sha256=hashes.stamp,
+        not_before=time.time(),
+    )
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=request_path.parent,
+        prefix=".hermes-update-visible-request-", delete=False,
+    ) as stream:
+        json.dump(payload, stream, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(stream.name, request_path)
+
+
+def verify_visible_receipt(root, app, nonce, authority, expected, hashes, main, tree, fresh, launched_at):
+    """Require a fresh main-process receipt; renderer/backend identity stays independently observed."""
+    _, receipt_path = _visible_paths(root)
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("fresh visible-window receipt missing") from exc
+    renderer_executable = (
+        Path(app) / "Contents/Frameworks/Hermes Helper (Renderer).app/Contents/MacOS/"
+        "Hermes Helper (Renderer)"
+    )
+    renderer = tree.get(receipt.get("renderer_pid"))
+    app_started_ms = main.start[0] * 1000 + main.start[1] / 1000
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("nonce") != nonce
+        or receipt.get("authority") != authority
+        or receipt.get("expected_commit") != expected["sha"]
+        or receipt.get("bundle") != str(Path(app))
+        or receipt.get("stamp_sha256") != hashes.stamp
+        or receipt.get("app_pid") != main.pid
+        or not isinstance(receipt.get("app_start_epoch_ms"), (int, float))
+        or abs(receipt["app_start_epoch_ms"] - app_started_ms) > 5000
+        or receipt.get("visible") is not True
+        or receipt.get("focused") is not True
+        or not isinstance(receipt.get("recorded_at"), (int, float))
+        or not launched_at <= receipt["recorded_at"] <= time.time() + 1
+        or renderer is None
+        or renderer.executable != renderer_executable
+    ):
+        raise RuntimeError("visible-window receipt identity mismatch")
+    if fresh[0] == "local":
+        claimed_backend = tree.get(receipt.get("backend_pid"))
+        if (
+            receipt.get("backend_mode") != "local"
+            or receipt.get("backend_port") != fresh[1]
+            or receipt.get("backend_pid") != fresh[2]
+            or claimed_backend is None
+            or claimed_backend.start != fresh[3]
+        ):
+            raise RuntimeError("visible-window receipt backend identity mismatch")
+    elif receipt.get("backend_mode") != "remote":
+        raise RuntimeError("visible-window receipt remote identity mismatch")
+
+
 def descendants(rows, main):
     tree = {main.pid: main}
     for _ in range(len(rows)):
@@ -426,7 +504,8 @@ def readiness(text, tree, expected, not_before=0):
     return ("local", port, *listeners[0])
 
 
-def adopt(app, expected, log, retained=None, *, startup=90, stability=10, owned=None):
+def adopt(app, expected, log, retained=None, *, startup=90, stability=10, owned=None,
+          root=None, nonce="", authority=None):
     app = Path(app)
     owned = {} if owned is None else owned
     bundles = [app] + ([retained] if retained else [])
@@ -434,6 +513,10 @@ def adopt(app, expected, log, retained=None, *, startup=90, stability=10, owned=
     if before.state != "none":
         raise RuntimeError("launch refused: bundle readers " + before.state)
     hashes, cursor = validate(app, expected), LogCursor(log)
+    if nonce and authority is not None:
+        if root is None:
+            raise RuntimeError("visible receipt root missing")
+        write_visible_request(root, nonce, authority, expected, hashes)
     launched_at = time.time()
     launch_app(app)
     deadline, stable_since, identity, evidence = time.monotonic() + startup, None, None, None
@@ -474,6 +557,11 @@ def adopt(app, expected, log, retained=None, *, startup=90, stability=10, owned=
                     if any(final.get(pid) != p for pid, p in tree.items()):
                         raise RuntimeError("process tree changed at adoption boundary")
                     cursor.read()
+                    if nonce and authority is not None:
+                        verify_visible_receipt(
+                            root, app, nonce, authority, expected, hashes,
+                            main, tree, fresh, launched_at,
+                        )
                     return main
             elif stable_since is not None:
                 raise RuntimeError("readiness or renderer lost during stability")
@@ -527,7 +615,7 @@ def stop_owned(owned):
     raise RuntimeError("candidate processes did not exit within 30 seconds")
 
 
-def recover(target, retained, old_hashes, old_expected, log, owned):
+def recover(target, retained, old_hashes, old_expected, log, owned, *, root=None, nonce="", authority=None):
     try:
         stop_owned(owned)
         require_absent([target, retained])
@@ -541,13 +629,16 @@ def recover(target, retained, old_hashes, old_expected, log, owned):
     except Exception as exc:
         return Outcome(7, f"Source/backend advanced; shell recovery uncertain. Manual recovery required: {exc}. Both bundle paths retained: {target}, {retained}")
     try:
-        adopt(target, old_expected, log, retained)
+        adopt(
+            target, old_expected, log, retained,
+            root=root, nonce=nonce, authority=authority,
+        )
         return Outcome(6, f"Source/backend advanced; previous shell restored and reopened. Candidate retained at {retained}.")
     except Exception as exc:
         return Outcome(7, f"Source/backend advanced; previous shell restored, reopening unverified. Manual recovery required: {exc}. Candidate retained at {retained}.")
 
 
-def publish_candidate(root, target, owner):
+def publish_candidate(root, target, owner, *, nonce="", authority=None):
     target = preflight(root, target)
     expected = expectation(root)
     candidate = select_candidate(root, expected)
@@ -578,7 +669,10 @@ def publish_candidate(root, target, owner):
             raise RuntimeError("post-exchange bundle identity mismatch")
         require_absent([target, retained])
         clear_marker(Path(root).parent / ".hermes-update-in-progress", owner)
-        adopt(target, expected, log, retained, owned=owned)
+        adopt(
+            target, expected, log, retained, owned=owned,
+            root=root, nonce=nonce, authority=authority,
+        )
         return Outcome(0, f"Updated Desktop adopted. Previous shell retained at {retained}.")
     except Exception as exc:
         # A signal can arrive after the native swap but before its wrapper returns.
@@ -590,33 +684,88 @@ def publish_candidate(root, target, owner):
                 raise RuntimeError("bundle directory identities changed")
         except Exception as identity_error:
             return Outcome(7, f"Source/backend advanced; publication state uncertain. Manual recovery required: {identity_error}. Both paths retained: {target}, {retained}")
-        restored = recover(target, retained, old_hashes, old_expected, log, owned)
+        restored = recover(
+            target, retained, old_hashes, old_expected, log, owned,
+            root=root, nonce=nonce, authority=authority,
+        )
         restored.message = f"Candidate adoption failed ({exc}). {restored.message}"
         return restored
 
 
-def complete(root, target, branch, owner, update_code, message):
+def _publish_result(root, branch, nonce, authority, outcome, *, phase="final"):
+    result = dict(
+        ok=outcome.code == 0,
+        exit_code=outcome.code,
+        manual=outcome.code != 0,
+        message=outcome.message,
+        repo=str(Path(root).resolve()),
+        remote=(authority or {}).get("remote"),
+        remote_url=(authority or {}).get("remote_url"),
+        branch=branch,
+        tracking_ref=(authority or {}).get("tracking_ref"),
+        transaction_nonce=nonce,
+        visible_receipt=str(_visible_paths(root)[1]),
+        phase=phase,
+        finished_at=int(time.time()),
+    )
+    path = Path(root).parent / ".hermes-update-result.json"
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=Path(root).parent,
+        prefix=".hermes-update-result-", delete=False,
+    ) as stream:
+        json.dump(result, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(stream.name, path)
+
+
+def complete(root, target, branch, owner, update_code, message, *, nonce="", authority=None):
     root, target = Path(root), Path(target)
     outcome = Outcome(update_code or 5, message)
     try:
         if update_code:
-            outcome.message = f"Underlying update failed ({update_code}); shell preserved; source/backend may have advanced. {message}"
+            # Failure must be externally visible before attempting a relaunch.
+            # A later receipt atomically advances this pending record to final.
+            _publish_result(
+                root,
+                branch,
+                nonce,
+                authority,
+                Outcome(update_code, f"Underlying update failed ({update_code}); restoring existing shell. {message}"),
+                phase="failure-relaunch-pending",
+            )
+            current = expectation(root)
+            target_info = plistlib.loads((target / "Contents/Info.plist").read_bytes())
+            target_stamp = json.loads(
+                (target / "Contents/Resources/install-stamp.json").read_text(encoding="utf-8")
+            )
+            shell_expected = {
+                **current,
+                "version": target_info["CFBundleShortVersionString"],
+                "sha": target_stamp["commit"],
+            }
+            clear_marker(root.parent / ".hermes-update-in-progress", owner)
+            adopt(
+                target,
+                shell_expected,
+                root.parent / "logs/desktop.log",
+                root=root,
+                nonce=nonce,
+                authority=authority,
+            )
+            outcome = Outcome(
+                update_code,
+                f"Underlying update failed ({update_code}); existing shell was visibly restored. {message}",
+            )
         else:
-            outcome = publish_candidate(root, target, owner)
+            outcome = publish_candidate(
+                root, target, owner, nonce=nonce, authority=authority
+            )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
         outcome = Outcome(5, f"Source/backend advanced; previous shell preserved. Publication refused: {exc}")
     try:
         clear_marker(root.parent / ".hermes-update-in-progress", owner)
-        result = dict(ok=outcome.code == 0, exit_code=outcome.code, manual=outcome.code != 0,
-                      message=outcome.message, branch=branch, finished_at=int(time.time()))
-        path = root.parent / ".hermes-update-result.json"
-        # Existing result protocol; a failed write cannot become a successful event.
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root.parent,
-                                         prefix=".hermes-update-result-", delete=False) as stream:
-            json.dump(result, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(stream.name, path)
+        _publish_result(root, branch, nonce, authority, outcome)
     except (OSError, IndexError) as exc:
         return Outcome(9, f"{outcome.message} Terminal result could not be recorded ({type(exc).__name__}); manual follow-up required.")
     return outcome
@@ -628,7 +777,11 @@ def main():
     parser.add_argument("root", type=Path)
     parser.add_argument("target", type=Path)
     parser.add_argument("--owner", type=int, default=0)
-    parser.add_argument("--branch", default="main")
+    parser.add_argument("--branch", default="")
+    parser.add_argument("--remote", default="")
+    parser.add_argument("--remote-url", default="")
+    parser.add_argument("--tracking-ref", default="")
+    parser.add_argument("--nonce", default="")
     parser.add_argument("--update-code", type=int, default=0)
     parser.add_argument("--message", default="")
     args = parser.parse_args()
@@ -647,7 +800,26 @@ def main():
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"Publication refused before update: {exc}")
             return 5
-    outcome = complete(args.root, args.target, args.branch, args.owner, args.update_code, args.message)
+    if not all((args.branch, args.remote, args.remote_url, args.tracking_ref, args.nonce)):
+        print("Publication refused: explicit update authority is incomplete")
+        return 5
+    authority = {
+        "repo": str(args.root.resolve()),
+        "remote": args.remote,
+        "remote_url": args.remote_url,
+        "branch": args.branch,
+        "tracking_ref": args.tracking_ref,
+    }
+    outcome = complete(
+        args.root,
+        args.target,
+        args.branch,
+        args.owner,
+        args.update_code,
+        args.message,
+        nonce=args.nonce,
+        authority=authority,
+    )
     print(outcome.message)
     return outcome.code
 

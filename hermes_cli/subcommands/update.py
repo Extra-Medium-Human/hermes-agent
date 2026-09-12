@@ -66,4 +66,16 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "--force-venv", action="store_true", default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
+    # Internal Desktop handoff contract. These are deliberately explicit and
+    # all-or-nothing: the updater must never infer origin/main when the app has
+    # selected another authority.
+    update_parser.add_argument("--authority-repo", default=None)
+    update_parser.add_argument("--authority-remote", default=None)
+    update_parser.add_argument("--authority-remote-url", default=None)
+    update_parser.add_argument("--authority-branch", default=None)
+    update_parser.add_argument("--authority-tracking-ref", default=None)
+    update_parser.add_argument("--authority-token", default=None)
+    update_parser.add_argument("--authority-nonce", default=None)
+    update_parser.add_argument("--authority-owner", default=None, type=int)
+    update_parser.add_argument("--state-snapshot-receipt", default=None)
     update_parser.set_defaults(func=cmd_update)

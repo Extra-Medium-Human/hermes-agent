@@ -394,7 +394,14 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
-import { branchTipApiUrl, cacheIsFresh, compareApiUrl, githubRepoSlug, parseCompare } from './update-api-check'
+import { branchTipApiUrl, compareApiUrl, parseCompare } from './update-api-check'
+import {
+  authorityPreflightInvocation,
+  parseAuthorityPreflightResult,
+  parseHandoffReadiness,
+  parseUpdateAuthorityConfig,
+  type UpdateAuthority
+} from './update-authority'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
@@ -861,6 +868,8 @@ const DESKTOP_INSTALLATION_PATH = path.join(app.getPath('userData'), 'desktop-in
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
 const DESKTOP_UPDATE_CHECK_CACHE_PATH = path.join(app.getPath('userData'), 'update-check-cache.json')
 const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-state.json')
+const UPDATE_VISIBLE_REQUEST_PATH = path.join(HERMES_HOME, '.hermes-update-visible-request.json')
+const UPDATE_VISIBLE_RECEIPT_PATH = path.join(HERMES_HOME, '.hermes-update-visible-receipt.json')
 const DESKTOP_BACKEND_OWNERSHIP_PATH = path.join(app.getPath('userData'), 'backend-ownership.json')
 const DESKTOP_MANAGED_SSH_RECOVERY_PATH = path.join(app.getPath('userData'), 'managed-ssh-update-recovery.json')
 // active-profile.json records which Hermes profile the desktop launches its
@@ -3021,15 +3030,17 @@ function recentHermesLog() {
 
 // ─── Self-update (git-pull against the running backend's hermes root) ──────
 
-function readDesktopUpdateConfig() {
+function readDesktopUpdateConfig(): any {
   try {
     const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CONFIG_PATH, 'utf8'))
-    const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
-
-    return { branch: branch || DEFAULT_UPDATE_BRANCH }
+    return parsed && typeof parsed === 'object' ? parsed : {}
   } catch {
-    return { branch: DEFAULT_UPDATE_BRANCH }
+    return {}
   }
+}
+
+function configuredUpdateAuthority(updateRoot: string) {
+  return parseUpdateAuthorityConfig(readDesktopUpdateConfig(), updateRoot)
 }
 
 // Atomic file write: temp + rename (atomic on all platforms). Prevents
@@ -3150,6 +3161,136 @@ function runGit(args, options: any = {}): Promise<{ code: number; stdout: string
   })
 }
 
+function runCapturedProcess(
+  command: string,
+  args: string[],
+  options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise(resolve => {
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const child = spawn(
+      command,
+      args,
+      hiddenWindowsChildOptions({
+        cwd: options.cwd,
+        env: { ...process.env, ...(options.env || {}) },
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+    )
+    const finish = (code: number) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(timer)
+      resolve({ code, stdout, stderr })
+    }
+    child.stdout?.on('data', chunk => {
+      stdout += chunk.toString()
+    })
+    child.stderr?.on('data', chunk => {
+      stderr += chunk.toString()
+    })
+    child.once('error', error => {
+      stderr += String(error)
+      finish(-1)
+    })
+    child.once('close', code => finish(typeof code === 'number' ? code : -1))
+    const timer = setTimeout(() => {
+      stderr += '\nupdate authority command timed out'
+      child.kill('SIGKILL')
+      finish(124)
+    }, options.timeoutMs ?? 305_000)
+  })
+}
+
+function updateAuthorityPython(updateRoot: string) {
+  const candidates = [
+    path.join(updateRoot, 'venv', 'bin', 'python3'),
+    path.join(updateRoot, 'venv', 'bin', 'python'),
+    getVenvPython(VENV_ROOT)
+  ]
+  return candidates.find(fileExists) || findSystemPython()
+}
+
+async function runDesktopAuthorityProbe(
+  updateRoot: string,
+  authority: UpdateAuthority,
+  values: { action: 'check' | 'preflight' | 'validate'; nonce: string; ownerPid: number; tokenPath?: string }
+) {
+  const invocation = authorityPreflightInvocation(updateAuthorityPython(updateRoot), authority, values)
+  const output = await runCapturedProcess(invocation.command, invocation.args, {
+    cwd: updateRoot,
+    env: {
+      PYTHONPATH: [updateRoot, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+      GIT_TERMINAL_PROMPT: '0',
+      GCM_INTERACTIVE: 'Never'
+    }
+  })
+  return parseAuthorityPreflightResult(output.code, output.stdout, output.stderr)
+}
+
+async function createDesktopStateSnapshot(updateRoot: string, nonce: string) {
+  const output = await runCapturedProcess(
+    updateAuthorityPython(updateRoot),
+    ['-m', 'hermes_cli.update_state_snapshot', 'snapshot', '--home', HERMES_HOME, '--nonce', nonce],
+    {
+      cwd: updateRoot,
+      env: { PYTHONPATH: [updateRoot, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) }
+    }
+  )
+  try {
+    const parsed = JSON.parse(output.stdout)
+    if (
+      output.code === 0 &&
+      parsed?.ok === true &&
+      typeof parsed.receipt === 'string' &&
+      typeof parsed.sha256 === 'string'
+    ) {
+      return { ok: true as const, receipt: parsed.receipt, sha256: parsed.sha256, size: parsed.size }
+    }
+    if (parsed?.ok === false && typeof parsed.message === 'string') {
+      return { ok: false as const, code: 'STATE_SNAPSHOT_INVALID', message: parsed.message }
+    }
+  } catch {
+    void 0
+  }
+  return {
+    ok: false as const,
+    code: 'STATE_SNAPSHOT_UNVERIFIED',
+    message: 'The live state database could not be snapshotted and verified.'
+  }
+}
+
+async function waitForAuthorityHandoffReady(
+  readyPath: string,
+  expected: {
+    authority: UpdateAuthority
+    ownerPid: number
+    nonce: string
+    head: string
+    remoteTip: string
+  },
+  timeoutMs = 5_000
+) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const result = parseHandoffReadiness(fs.readFileSync(readyPath, 'utf8'), expected)
+      return result
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  }
+  return {
+    ok: false as const,
+    code: 'HANDOFF_NOT_READY',
+    message: 'Detached updater did not prove transaction-bound readiness; Hermes stayed open.'
+  }
+}
+
 const firstLine = text => (text || '').split('\n').find(Boolean) || ''
 
 async function getOriginUrl(updateRoot) {
@@ -3204,58 +3345,73 @@ async function resolveHealedBranch(updateRoot, branch) {
 // update changes HEAD, which busts the cache immediately). `git fetch` runs only
 // inside applyUpdates. `force` (menu item, Settings "Check now") skips the
 // cache; the renderer's background poller never passes it.
-async function checkUpdates({ force = false }: { force?: boolean } = {}) {
+async function checkUpdates({ force: _force = false }: { force?: boolean } = {}) {
   const updateRoot = resolveUpdateRoot()
-  let { branch } = readDesktopUpdateConfig()
-  const gitDir = path.join(updateRoot, '.git')
+  const authorityResult = configuredUpdateAuthority(updateRoot)
 
-  if (!directoryExists(gitDir)) {
+  if (authorityResult.ok === false) {
+    return {
+      supported: true,
+      branch: readDesktopUpdateConfig().branch,
+      error: authorityResult.code,
+      message: authorityResult.message,
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
+  if (!directoryExists(path.join(updateRoot, '.git'))) {
     return {
       supported: false,
       reason: 'not-a-git-checkout',
       message: `${updateRoot} isn't a git checkout — desktop self-update only runs against a source install.`,
       hermesRoot: updateRoot,
-      branch
+      branch: authorityResult.authority.branch
     }
   }
 
-  const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+  const nonce = crypto.randomUUID()
+  const probed = await runDesktopAuthorityProbe(updateRoot, authorityResult.authority, {
+    action: 'check',
+    nonce,
+    ownerPid: process.pid
+  })
+  if (probed.ok === false) {
+    return {
+      supported: true,
+      branch: authorityResult.authority.branch,
+      remote: authorityResult.authority.remote,
+      error: probed.code,
+      message: probed.message,
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
 
-  const [currentSha, dirtyStr, currentBranch, originUrl] = await Promise.all([
-    git(['rev-parse', 'HEAD']),
-    git(['status', '--porcelain']),
-    git(['rev-parse', '--abbrev-ref', 'HEAD']),
-    getOriginUrl(updateRoot)
+  const [branchState, dirtyState] = await Promise.all([
+    runGit(['branch', '--show-current'], { cwd: updateRoot }),
+    runGit(['status', '--porcelain=v1', '--untracked-files=all'], { cwd: updateRoot })
   ])
-
-  const cached = readUpdateCheckCache()
-  const now = Date.now()
-
-  if (!force && cacheIsFresh(cached, { branch, currentSha, now })) {
-    return { ...cached.status, dirty: dirtyStr.length > 0, currentBranch }
+  let behind: number | null = 0
+  if (probed.topology === 'behind') {
+    const count = await runGit(['rev-list', '--count', `${probed.head}..${probed.remoteTip}`], { cwd: updateRoot })
+    behind = count.code === 0 && /^\d+$/.test(count.stdout.trim()) ? Number(count.stdout.trim()) : null
   }
-
-  branch = await resolveHealedBranch(updateRoot, branch)
-  const slug = githubRepoSlug(originUrl)
-
-  const status = slug
-    ? await checkUpdatesViaApi({ slug, branch, currentSha })
-    : await checkUpdatesViaLsRemote({ updateRoot, branch, currentSha })
-
-  const result = {
+  return {
     supported: true,
-    branch,
-    currentBranch,
-    currentSha,
-    dirty: dirtyStr.length > 0,
+    branch: authorityResult.authority.branch,
+    remote: authorityResult.authority.remote,
+    trackingRef: authorityResult.authority.trackingRef,
+    currentBranch: branchState.stdout.trim(),
+    currentSha: probed.head,
+    targetSha: probed.remoteTip,
+    dirty: Boolean(dirtyState.stdout),
+    behind,
+    updateAvailable: probed.topology === 'behind',
+    commits: [],
     hermesRoot: updateRoot,
-    fetchedAt: now,
-    ...status
+    fetchedAt: Date.now()
   }
-
-  writeUpdateCheckCache({ fetchedAt: now, currentSha, branch, status: result })
-
-  return result
 }
 
 function readUpdateCheckCache() {
@@ -4020,18 +4176,12 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
   updateInFlight = true
 
   try {
-    const updater = resolveUpdaterBinary()
+    const updater = IS_WINDOWS ? resolveUpdaterBinary() : null
 
-    if (!updater && !IS_WINDOWS) {
-      // macOS/Linux: hand off to the repo-owned posix script — same shape as
-      // Windows (quit → detached orchestrator → `hermes update` → relaunch),
-      // minus the venv-lock gauntlet POSIX doesn't need. The old in-app
-      // updater (applyUpdatesPosixInApp) is gone with everything it dragged
-      // in: the HERMES_DESKTOP_CHILD_PID reaper-exclusion dance (#37532),
-      // the in-window rebuild retry, and the relaunch-outcome matrix — the
-      // script owns swap/relaunch, and the app is DEAD during the update so
-      // there is nothing to reap around. Checkouts that predate the script
-      // get the manual `hermes update` card once; their next update pulls it.
+    if (!IS_WINDOWS) {
+      // POSIX always uses the repo-owned, authority-bound orchestrator. A
+      // staged installer binary can be months behind and cannot carry this
+      // transaction tuple or its visible-window receipt contract.
       return await applyUpdatesPosixHandoff(opts)
     }
 
@@ -4495,6 +4645,76 @@ function runningAppBundle() {
   return dir.endsWith('.app') ? dir : null
 }
 
+function publishVisibleUpdateReceipt(backend: { pid?: number; port?: number; mode: string }) {
+  if (!IS_MAC || !mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+  let request
+  try {
+    request = JSON.parse(fs.readFileSync(UPDATE_VISIBLE_REQUEST_PATH, 'utf8'))
+  } catch {
+    return
+  }
+  if (
+    request?.schema_version !== 1 ||
+    typeof request.nonce !== 'string' ||
+    typeof request.expected_commit !== 'string' ||
+    typeof request.not_before !== 'number' ||
+    Date.now() / 1000 - request.not_before > 300
+  ) {
+    rememberLog('[updates] visible receipt request rejected as malformed or stale')
+    return
+  }
+  try {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore()
+    }
+    mainWindow.show()
+    mainWindow.focus()
+    app.focus({ steal: true })
+    if (!mainWindow.isVisible()) {
+      rememberLog('[updates] visible receipt withheld: main window is not visible after reveal')
+      return
+    }
+    const bundle = runningAppBundle()
+    if (!bundle) {
+      return
+    }
+    const stampPath = path.join(bundle, 'Contents', 'Resources', 'install-stamp.json')
+    const stamp = JSON.parse(fs.readFileSync(stampPath, 'utf8'))
+    if (stamp?.commit !== request.expected_commit) {
+      rememberLog('[updates] visible receipt withheld: install stamp does not match request')
+      return
+    }
+    const receipt = {
+      schema_version: 1,
+      nonce: request.nonce,
+      authority: request.authority,
+      expected_commit: request.expected_commit,
+      bundle,
+      stamp_sha256: crypto.createHash('sha256').update(fs.readFileSync(stampPath)).digest('hex'),
+      app_pid: process.pid,
+      app_start_epoch_ms: Math.round(Date.now() - process.uptime() * 1000),
+      renderer_pid: mainWindow.webContents.getOSProcessId(),
+      backend_pid: backend.pid ?? null,
+      backend_port: backend.port ?? null,
+      backend_mode: backend.mode,
+      visible: mainWindow.isVisible(),
+      focused: mainWindow.isFocused(),
+      recorded_at: Date.now() / 1000
+    }
+    writeFileAtomic(UPDATE_VISIBLE_RECEIPT_PATH, JSON.stringify(receipt), 'utf8')
+    try {
+      fs.unlinkSync(UPDATE_VISIBLE_REQUEST_PATH)
+    } catch {
+      void 0
+    }
+    rememberLog(`[updates] visible receipt published nonce=${request.nonce} rendererPid=${receipt.renderer_pid}`)
+  } catch (error) {
+    rememberLog(`[updates] visible receipt failed: ${error?.message || error}`)
+  }
+}
+
 // ── Pre-flight state.db integrity guard (#68474) ─────────────────────
 // Take an emergency snapshot of state.db and verify the live copy is
 // intact before any update process mutates the install.  Runs in the
@@ -4597,36 +4817,64 @@ async function applyUpdatesPosixHandoff(opts: any) {
     return { ok: true, manual: true, command: 'hermes update', hermesRoot: updateRoot }
   }
 
+  const authorityResult = configuredUpdateAuthority(updateRoot)
+  if (authorityResult.ok === false) {
+    rememberLog(`[updates] refusing posix hand-off [${authorityResult.code}]: ${authorityResult.message}`)
+    emitUpdateProgress({ stage: 'error', message: authorityResult.message, percent: null })
+    return { ok: false, error: authorityResult.code, message: authorityResult.message }
+  }
+  const authority = authorityResult.authority
+  const nonce = crypto.randomUUID()
+  const transactionDir = path.join(HERMES_HOME, '.hermes-update-transactions', nonce)
+  const tokenPath = path.join(transactionDir, 'authority.json')
+  const readyPath = path.join(transactionDir, 'helper-ready.json')
+  const probed = await runDesktopAuthorityProbe(updateRoot, authority, {
+    action: 'preflight',
+    nonce,
+    ownerPid: process.pid,
+    tokenPath
+  })
+  if (probed.ok === false) {
+    rememberLog(`[updates] authority preflight refused [${probed.code}]: ${probed.message}`)
+    emitUpdateProgress({ stage: 'error', message: probed.message, percent: null })
+    return { ok: false, error: probed.code, message: probed.message }
+  }
+  if (probed.topology === 'equal') {
+    const message = `Hermes is already current at ${authority.remote}/${authority.branch} (${probed.head.slice(0, 12)}).`
+    emitUpdateProgress({ stage: 'done', message, percent: 100 })
+    return { ok: true, current: true, message, authority }
+  }
+
   const handoffConflict = updateHandoffConflict(HERMES_HOME)
 
   if (handoffConflict) {
-    // Same hazard as the Windows path (#75778): a live foreign updater
-    // already owns the marker — refuse rather than double-mutate the tree.
     rememberLog(`[updates] refusing posix hand-off: ${handoffConflict.message}`)
     emitUpdateProgress({ stage: 'error', message: handoffConflict.message, percent: null })
-
     return { ok: false, error: 'update-already-running', message: handoffConflict.message }
   }
 
-  // ── Pre-flight state.db integrity guard (#68474) ──
-  preflightStateDb(HERMES_HOME, rememberLog)
-
-  // Branch-pin so a non-main checkout doesn't get switched to main (and
-  // self-heal to main when the pinned branch no longer exists on origin).
-  let branch = 'main'
-
-  try {
-    const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-    const current = (head.stdout || '').trim()
-
-    if (head.code === 0 && current && current !== 'HEAD') {
-      branch = await resolveHealedBranch(updateRoot, current)
-    }
-  } catch {
-    // best effort
+  const snapshot = await createDesktopStateSnapshot(updateRoot, nonce)
+  if (!snapshot.ok) {
+    rememberLog(`[updates] state snapshot refused [${snapshot.code}]: ${snapshot.message}`)
+    emitUpdateProgress({ stage: 'error', message: snapshot.message, percent: null })
+    return { ok: false, error: snapshot.code, message: snapshot.message }
   }
 
-  const args = [...handoff.args, '--install-root', updateRoot, '--branch', branch, '--desktop-pid', String(process.pid)]
+  const branch = authority.branch
+  const args = [
+    ...handoff.args,
+    '--install-root', updateRoot,
+    '--branch', branch,
+    '--desktop-pid', String(process.pid),
+    '--authority-remote', authority.remote,
+    '--authority-remote-url', authority.remoteUrl,
+    '--authority-tracking-ref', authority.trackingRef,
+    '--authority-nonce', nonce,
+    '--authority-owner', String(process.pid),
+    '--authority-token', tokenPath,
+    '--authority-ready', readyPath,
+    '--state-snapshot-receipt', snapshot.receipt
+  ]
   const updateStartedAt = Math.floor(Date.now() / 1000)
 
   // Relaunch target: the running .app bundle on mac (script swaps the
@@ -4667,37 +4915,52 @@ async function applyUpdatesPosixHandoff(opts: any) {
     stdio: 'ignore'
   })
 
-  // Bridge marker (same contract as the Windows hand-off): cover the gap
-  // until the script claims the marker with its own pid as step 0. If the
-  // script never starts, the dead pid reads as stale and self-deletes.
-  if (Number.isInteger(child.pid)) {
-    writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
+  rememberLog(`[updates] launched posix hand-off candidate: ${handoff.scriptPath} (${authority.remote}/${branch}); awaiting bound readiness`)
+  emitUpdateProgress({
+    stage: 'checking',
+    message: 'Verifying the detached updater before Hermes closes…',
+    percent: 95
+  })
+
+  const dwellStartedAt = Date.now()
+  const [handoffOutcome, readiness] = await Promise.all([
+    observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS),
+    waitForAuthorityHandoffReady(
+      readyPath,
+      {
+        authority,
+        ownerPid: process.pid,
+        nonce,
+        head: probed.head,
+        remoteTip: probed.remoteTip
+      },
+      305_000
+    )
+  ])
+
+  if (handoffOutcome.ok === false) {
+    const message = `Update hand-off refused: ${handoffOutcome.message} Hermes will keep running.`
+    rememberLog(`[updates] posix hand-off not viable, aborting quit: ${handoffOutcome.message}`)
+    emitUpdateProgress({ stage: 'error', message, percent: null })
+    return { ok: false, error: handoffOutcome.reason, message }
+  }
+  if (readiness.ok === false) {
+    const message = `Update hand-off refused: ${readiness.message} Hermes will keep running.`
+    rememberLog(`[updates] posix hand-off not ready, aborting quit: ${readiness.message}`)
+    emitUpdateProgress({ stage: 'error', message, percent: null })
+    return { ok: false, error: readiness.code, message }
   }
 
-  rememberLog(`[updates] launched posix hand-off: ${handoff.scriptPath} (branch ${branch}); quitting to hand off`)
+  rememberLog(
+    `[updates] posix hand-off ready: helperPid=${readiness.helperPid} nonce=${nonce} ` +
+      `${authority.remote}/${branch}@${probed.remoteTip}; quitting to hand off`
+  )
   emitUpdateProgress({
     stage: 'restart',
     message:
       'Updating Hermes — this window will close. Don’t reopen Hermes yourself; it restarts automatically when the update finishes.',
     percent: 100
   })
-
-  // Settle window (#66753): the reported macOS failure mode is exactly this
-  // path — the app quits, bash/posix.sh dies early (or was never spawnable),
-  // and the user is left with no app, no updater, and no relaunch. Watch the
-  // child through the dwell; on spawn error or early death, stay alive and
-  // surface the failure instead of quitting into nothing.
-  const dwellStartedAt = Date.now()
-  const handoffOutcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
-
-  if (!handoffOutcome.ok) {
-    const message = `Update failed to start: ${handoffOutcome.message}. Hermes will keep running — try again, or run \`hermes update\` from a terminal.`
-
-    rememberLog(`[updates] posix hand-off not viable, aborting quit: ${handoffOutcome.message}`)
-    emitUpdateProgress({ stage: 'error', message, percent: null })
-
-    return { ok: false, error: 'updater-spawn-failed', message }
-  }
 
   isQuittingForHandoff = true
   setTimeout(
@@ -12935,6 +13198,7 @@ async function runHermesStart() {
         running: true,
         error: null
       })
+      publishVisibleUpdateReceipt({ mode: 'remote' })
 
       return createPrimaryRemoteConnection(remote, hermesLog.slice(-80), getWindowState())
     }
@@ -13206,6 +13470,11 @@ async function runHermesStart() {
       progress: 94,
       running: true,
       error: null
+    })
+    publishVisibleUpdateReceipt({
+      pid: typeof hermesProcess.pid === 'number' ? hermesProcess.pid : undefined,
+      port: typeof port === 'number' ? port : undefined,
+      mode: 'local'
     })
 
     // A successful boot (including a soft restart that the repair-guard
@@ -17522,10 +17791,18 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
 ipcMain.handle('hermes:updates:branch:get', async () => readDesktopUpdateConfig())
 
 ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
-  const branch = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
-  writeDesktopUpdateConfig({ branch })
-
-  return { branch }
+  const config = readDesktopUpdateConfig()
+  const branch = typeof name === 'string' && name.trim() ? name.trim() : config.branch
+  if (!branch || typeof config.remote !== 'string') {
+    return { ...config, error: 'AUTHORITY_CONFIG_MISSING' }
+  }
+  const next = {
+    ...config,
+    branch,
+    tracking_ref: `refs/remotes/${config.remote}/${branch}`
+  }
+  writeDesktopUpdateConfig(next)
+  return next
 })
 
 // Resolve the canonical Hermes version (the one `release.py` bumps in

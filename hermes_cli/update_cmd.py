@@ -13,6 +13,7 @@ import shutil  # noqa: F401  (tests patch update_cmd.shutil.*; split modules res
 import subprocess
 import sys
 import time as _time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -145,6 +146,67 @@ def _record_update_step(step: str, ok: bool, detail: str = "") -> None:
     with suppress(Exception):
         from hermes_cli.update_receipt import record_step
         record_step(step, ok, detail)
+
+
+def _preflight_explicit_authority(args):
+    """Resolve and verify a Desktop-provided authority before any update state exists."""
+    from hermes_cli.update_authority import (
+        AuthorityRefusal,
+        authority_from_namespace,
+        probe_authority,
+        read_and_revalidate_token,
+    )
+
+    authority = authority_from_namespace(args)
+    handoff_names = (
+        "authority_token",
+        "authority_nonce",
+        "authority_owner",
+        "state_snapshot_receipt",
+    )
+    handoff_present = any(getattr(args, name, None) not in (None, "") for name in handoff_names)
+    if authority is None:
+        if handoff_present:
+            raise AuthorityRefusal(
+                "AUTHORITY_CONFIG_INVALID",
+                "authority handoff fields were provided without an authority tuple",
+            )
+        return None
+    if authority.repo.resolve() != _m().PROJECT_ROOT.resolve():
+        raise AuthorityRefusal(
+            "AUTHORITY_REPO_MISMATCH",
+            "explicit update authority does not name the active Hermes checkout",
+        )
+    requested_branch = str(getattr(args, "branch", "") or "").strip()
+    if requested_branch and requested_branch != authority.branch:
+        raise AuthorityRefusal(
+            "AUTHORITY_BRANCH_MISMATCH",
+            "--branch conflicts with the explicit authority branch",
+        )
+
+    token = getattr(args, "authority_token", None)
+    if token:
+        nonce = str(getattr(args, "authority_nonce", "") or "")
+        owner = getattr(args, "authority_owner", None)
+        snapshot = getattr(args, "state_snapshot_receipt", None)
+        if not nonce or not isinstance(owner, int) or owner <= 0 or not snapshot:
+            raise AuthorityRefusal(
+                "HANDOFF_TOKEN_MISMATCH",
+                "Desktop authority handoff is missing its owner, nonce, or state snapshot",
+            )
+        probe = read_and_revalidate_token(
+            Path(token), authority=authority, owner_pid=owner, nonce=nonce
+        )
+        from hermes_cli.update_state_snapshot import validate_snapshot_receipt
+
+        validate_snapshot_receipt(Path(snapshot), transaction_nonce=nonce)
+        return probe
+    if handoff_present:
+        raise AuthorityRefusal(
+            "HANDOFF_TOKEN_MISMATCH",
+            "partial Desktop authority handoff was refused",
+        )
+    return probe_authority(authority, nonce=uuid.uuid4().hex)
 
 
 # A fetch whose transport dead-stalls (HTTP/2 to GitHub on some networks, a black-holed proxy)
@@ -478,7 +540,7 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
         proc.stdout.close()
 
 
-def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
+def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, args=None):
     """``hermes update --check``: fetch and report without installing. ``branch_explicit`` is
     True iff --branch was passed (Docker installs print a notice instead of dropping the flag)."""
     # Same marker-first admission gate as the apply path, so --check never reports git
@@ -490,6 +552,34 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print(refusal.message)
         record_refusal_receipt(refusal)
         sys.exit(2)
+
+    if args is not None:
+        try:
+            authority_probe = _preflight_explicit_authority(args)
+        except Exception as exc:
+            from hermes_cli.update_authority import AuthorityRefusal
+            from hermes_cli.update_state_snapshot import StateSnapshotError
+
+            if not isinstance(exc, (AuthorityRefusal, StateSnapshotError)):
+                raise
+            code = getattr(exc, "code", "STATE_SNAPSHOT_INVALID")
+            print(f"✗ Update check refused [{code}]: {exc}")
+            sys.exit(1)
+        if authority_probe is not None:
+            if authority_probe.topology == "equal":
+                print("✓ Already up to date.")
+            else:
+                count = _count_commits_between(
+                    _base_git_cmd(),
+                    _m().PROJECT_ROOT,
+                    authority_probe.head,
+                    authority_probe.remote_tip,
+                )
+                _print_update_check_result(
+                    count if count > 0 else None,
+                    f"{authority_probe.authority.remote}/{authority_probe.authority.branch}",
+                )
+            return
 
     git_dir = _m().PROJECT_ROOT / ".git"
     if not git_dir.exists():
@@ -1276,6 +1366,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always restore stdio even on
     ``sys.exit``. Self-lock deferral deliberately does NOT run here (pre-fetch it stranded users
     on the OLD checkout in an exit-2 loop); it runs right before the dependency sync."""
+    try:
+        authority_probe = _preflight_explicit_authority(args)
+    except Exception as exc:
+        from hermes_cli.update_authority import AuthorityRefusal
+        from hermes_cli.update_state_snapshot import StateSnapshotError
+
+        if not isinstance(exc, (AuthorityRefusal, StateSnapshotError)):
+            raise
+        code = getattr(exc, "code", "STATE_SNAPSHOT_INVALID")
+        print(f"✗ Update refused [{code}]: {exc}")
+        sys.exit(1)
+    if authority_probe is not None and authority_probe.topology == "equal":
+        print(
+            "✓ Already at the configured update authority "
+            f"({authority_probe.authority.remote}/{authority_probe.authority.branch} "
+            f"{authority_probe.head[:12]})."
+        )
+        return
+
     opts = _resolve_update_options(args, gateway_mode)
     gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
 
@@ -1314,7 +1423,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
     had_desktop_app_before_update = _desktop_app_present(desktop_dir)
 
-    use_zip_update, git_cmd, is_fork = _prepare_git_command()
+    if authority_probe is not None:
+        use_zip_update, git_cmd, is_fork = False, _base_git_cmd(), False
+    else:
+        use_zip_update, git_cmd, is_fork = _prepare_git_command()
 
     if use_zip_update:
         try:
@@ -1327,6 +1439,49 @@ def _cmd_update_impl(args, gateway_mode: bool):
         return
 
     try:
+        if authority_probe is not None:
+            from hermes_cli.update_authority import apply_fast_forward
+
+            branch = authority_probe.authority.branch
+            print(
+                "→ Applying verified fast-forward from "
+                f"{authority_probe.authority.remote}/{branch}..."
+            )
+            pre_pull_sha = authority_probe.head
+            apply_fast_forward(authority_probe)
+            plan = _CheckoutPlan(
+                auto_stash_ref=None,
+                commit_count=max(
+                    1,
+                    _count_commits_between(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        authority_probe.head,
+                        authority_probe.remote_tip,
+                    ),
+                ),
+                in_place_update=False,
+                parked_branch_switched=False,
+                prompt_for_restore=False,
+                switch_block_reason=None,
+                upstream_checked=True,
+            )
+            _apply_pulled_update(
+                git_cmd,
+                branch,
+                pre_pull_sha,
+                plan,
+                opts,
+                gateway_mode=gateway_mode,
+                is_fork=False,
+                desktop_dir=desktop_dir,
+                had_desktop_app_before_update=had_desktop_app_before_update,
+                pre_update_snapshot_id=pre_update_snapshot_id,
+                _pre_update_plan=_pre_update_plan,
+                _windows_gateway_resume=_windows_gateway_resume,
+            )
+            return
+
         # Scoped fetch: a bare `git fetch origin` pulls thousands of branches and can stall.
         branch = _m()._resolve_update_branch(args)
 

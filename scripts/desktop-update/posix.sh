@@ -36,8 +36,11 @@
 set -u
 
 ORIGINAL_ARGS=("$@")
-INSTALL_ROOT="" BRANCH="main" DESKTOP_PID=0 RELAUNCH_TARGET=""
+INSTALL_ROOT="" BRANCH="" DESKTOP_PID=0 RELAUNCH_TARGET=""
 RELAUNCH_CWD="" SANDBOX_FALLBACK=0 RELAUNCH_ARGS=()
+AUTHORITY_REMOTE="" AUTHORITY_REMOTE_URL="" AUTHORITY_TRACKING_REF=""
+AUTHORITY_NONCE="" AUTHORITY_OWNER=0 AUTHORITY_TOKEN="" AUTHORITY_READY=""
+STATE_SNAPSHOT_RECEIPT=""
 NO_UI=0 NO_MARKER_CLEANUP=0 SELF_TEST_UI=0 SELF_TEST_GATE=0 SELF_TEST_MARKER=0
 SELF_TEST_TCC_HEAL=0
 HANDOFF_DAEMONIZED=0
@@ -46,6 +49,14 @@ while [ $# -gt 0 ]; do
     --install-root) INSTALL_ROOT="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
     --desktop-pid) DESKTOP_PID="$2"; shift 2 ;;
+    --authority-remote) AUTHORITY_REMOTE="$2"; shift 2 ;;
+    --authority-remote-url) AUTHORITY_REMOTE_URL="$2"; shift 2 ;;
+    --authority-tracking-ref) AUTHORITY_TRACKING_REF="$2"; shift 2 ;;
+    --authority-nonce) AUTHORITY_NONCE="$2"; shift 2 ;;
+    --authority-owner) AUTHORITY_OWNER="$2"; shift 2 ;;
+    --authority-token) AUTHORITY_TOKEN="$2"; shift 2 ;;
+    --authority-ready) AUTHORITY_READY="$2"; shift 2 ;;
+    --state-snapshot-receipt) STATE_SNAPSHOT_RECEIPT="$2"; shift 2 ;;
     --relaunch-target) RELAUNCH_TARGET="$2"; shift 2 ;;
     --relaunch-cwd) RELAUNCH_CWD="$2"; shift 2 ;;
     --sandbox-fallback) SANDBOX_FALLBACK=1; shift ;;
@@ -383,10 +394,13 @@ launch_app() { # attempted BEFORE the terminal event (launch acceptance is
 MANUAL=0  # 1 = update landed but the user must act (result protocol field)
 
 write_result() {
-  printf '{"ok":%s,"exit_code":%s,"manual":%s,"message":"%s","branch":"%s","finished_at":%s}' \
+  printf '{"ok":%s,"exit_code":%s,"manual":%s,"message":"%s","repo":"%s","remote":"%s","remote_url":"%s","branch":"%s","tracking_ref":"%s","transaction_nonce":"%s","finished_at":%s}' \
     "$([ "$FINAL_CODE" -eq 0 ] && echo true || echo false)" "$FINAL_CODE" \
     "$([ "$MANUAL" -eq 1 ] && echo true || echo false)" \
-    "$(json_escape "$FINAL_MSG")" "$(json_escape "$BRANCH")" "$(date +%s)" \
+    "$(json_escape "$FINAL_MSG")" "$(json_escape "$INSTALL_ROOT")" \
+    "$(json_escape "$AUTHORITY_REMOTE")" "$(json_escape "$AUTHORITY_REMOTE_URL")" \
+    "$(json_escape "$BRANCH")" "$(json_escape "$AUTHORITY_TRACKING_REF")" \
+    "$(json_escape "$AUTHORITY_NONCE")" "$(date +%s)" \
     > "$RESULT.tmp" 2>/dev/null && mv -f "$RESULT.tmp" "$RESULT" 2>/dev/null || true
 }
 
@@ -399,6 +413,8 @@ finish() {
     tcc_probe_python "$py" || py="$(command -v python3)"
     outcome="$("$py" "$SCRIPT_DIR/../../hermes_cli/desktop_macos_update.py" complete \
       "$INSTALL_ROOT" "$RELAUNCH_TARGET" --owner "$$" --branch "$BRANCH" \
+      --remote "$AUTHORITY_REMOTE" --remote-url "$AUTHORITY_REMOTE_URL" \
+      --tracking-ref "$AUTHORITY_TRACKING_REF" --nonce "$AUTHORITY_NONCE" \
       --update-code "$FINAL_CODE" --message "$FINAL_MSG" 2>>"$LOG")"
     FINAL_CODE=$?
     FINAL_MSG="${outcome:-macOS publication helper failed; shell state unverified. Manual recovery required.}"
@@ -655,6 +671,60 @@ os.execve("/bin/bash", ["/bin/bash", sys.argv[1], *sys.argv[2:]], env)
   exit 0
 fi
 
+# The daemon must prove it owns the exact Desktop-frozen transaction before
+# the Desktop releases a backend or quits. No defaults and no branch healing:
+# every value is the same explicit authority tuple.
+for required in "$BRANCH" "$AUTHORITY_REMOTE" "$AUTHORITY_REMOTE_URL" \
+  "$AUTHORITY_TRACKING_REF" "$AUTHORITY_NONCE" "$AUTHORITY_TOKEN" \
+  "$AUTHORITY_READY" "$STATE_SNAPSHOT_RECEIPT"; do
+  if [ -z "$required" ]; then
+    trap - EXIT
+    exit 64
+  fi
+done
+AUTHORITY_PY="$INSTALL_ROOT/venv/bin/python3"
+tcc_probe_python "$AUTHORITY_PY" || AUTHORITY_PY="$(command -v python3 2>/dev/null)"
+[ -n "$AUTHORITY_PY" ] || { trap - EXIT; exit 64; }
+AUTHORITY_ARGS=(
+  --repo "$INSTALL_ROOT"
+  --remote "$AUTHORITY_REMOTE"
+  --remote-url "$AUTHORITY_REMOTE_URL"
+  --branch "$BRANCH"
+  --tracking-ref "$AUTHORITY_TRACKING_REF"
+  --nonce "$AUTHORITY_NONCE"
+  --owner "$AUTHORITY_OWNER"
+  --helper "$$"
+  --token "$AUTHORITY_TOKEN"
+)
+run_authority_validation() {
+  env PYTHONPATH="$INSTALL_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$AUTHORITY_PY" -m hermes_cli.update_authority validate "${AUTHORITY_ARGS[@]}"
+}
+AUTHORITY_JSON="$(run_authority_validation 2>&1)"; AUTHORITY_CODE=$?
+if [ "$AUTHORITY_CODE" -ne 0 ]; then
+  mkdir -p "$(dirname "$AUTHORITY_READY")" 2>/dev/null || true
+  printf '%s\n' "$AUTHORITY_JSON" > "$AUTHORITY_READY.tmp" 2>/dev/null \
+    && mv -f "$AUTHORITY_READY.tmp" "$AUTHORITY_READY" 2>/dev/null || true
+  trap - EXIT
+  exit "$AUTHORITY_CODE"
+fi
+
+# Marker identity retains the helper pid, acquisition time, Desktop owner, and
+# transaction nonce. Legacy readers intentionally ignore lines 3-4.
+NOW="$(date +%s)"
+STARTED_AT="${HERMES_UPDATE_STARTED_AT:-$NOW}"
+case "$STARTED_AT" in ''|*[!0-9]*) STARTED_AT="$NOW" ;; esac
+MIN_STARTED_AT=$((NOW - 1200))
+if [ "${#STARTED_AT}" -ne "${#NOW}" ] \
+    || [[ "$STARTED_AT" > "$NOW" || "$STARTED_AT" < "$MIN_STARTED_AT" ]]; then
+  STARTED_AT="$NOW"
+fi
+printf '%s\n%s\n%s\n%s\n' "$$" "$STARTED_AT" "$AUTHORITY_OWNER" "$AUTHORITY_NONCE" > "$MARKER" 2>/dev/null \
+  || { trap - EXIT; exit 64; }
+printf '%s\n' "$AUTHORITY_JSON" > "$AUTHORITY_READY.tmp" 2>/dev/null \
+  && mv -f "$AUTHORITY_READY.tmp" "$AUTHORITY_READY" 2>/dev/null \
+  || { rm -f "$MARKER" 2>/dev/null; trap - EXIT; exit 64; }
+
 # Electron terminates the entire detached updater process group during quit,
 # including the loopback status server.  Arm TERM immunity before `start_ui`
 # so the shim server and the later `hermes update` subprocess both inherit
@@ -662,23 +732,8 @@ fi
 # command has returned; the already-running server keeps the inherited setting
 # until normal cleanup closes it.
 trap '' TERM
-log "hand-off start: root=$INSTALL_ROOT branch=$BRANCH desktopPid=$DESKTOP_PID pid=$$"
+log "hand-off start: root=$INSTALL_ROOT authority=$AUTHORITY_REMOTE/$BRANCH desktopPid=$DESKTOP_PID pid=$$ nonce=$AUTHORITY_NONCE"
 rm -f "$RESULT" 2>/dev/null || true
-
-# Marker claim: same cross-process lock contract as windows.ps1 /
-# update_lock.py (the `hermes update` child adopts it via process ancestry).
-# The Desktop supplies one acquisition time for the whole ownership chain.
-NOW="$(date +%s)"
-STARTED_AT="${HERMES_UPDATE_STARTED_AT:-$NOW}"
-case "$STARTED_AT" in ''|*[!0-9]*) STARTED_AT="$NOW" ;; esac
-MIN_STARTED_AT=$((NOW - 1200))
-# Compare the validated decimal strings before doing arithmetic. Shell integer
-# expansion can wrap on an attacker-controlled value wider than signed 64-bit.
-if [ "${#STARTED_AT}" -ne "${#NOW}" ] \
-    || [[ "$STARTED_AT" > "$NOW" || "$STARTED_AT" < "$MIN_STARTED_AT" ]]; then
-  STARTED_AT="$NOW"
-fi
-printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER" 2>/dev/null || log "WARNING: could not write update marker"
 
 if [ "$SELF_TEST_MARKER" -eq 1 ]; then
   trap - EXIT
@@ -692,6 +747,26 @@ if [ "$DESKTOP_PID" -gt 0 ] 2>/dev/null; then
     FINAL_CODE=4 FINAL_MSG="Update aborted: the Hermes window (pid $DESKTOP_PID) did not exit within 30s. Nothing was changed. Close Hermes fully and try again."
     log "$FINAL_MSG"; exit "$FINAL_CODE"
   fi
+fi
+
+# Revalidate after the Desktop is gone and immediately before any source,
+# runtime, or package mutation. A moved remote tip, changed dirty identity,
+# stale nonce, or damaged snapshot takes the deterministic failure relaunch.
+AUTHORITY_JSON="$(run_authority_validation 2>&1)"; AUTHORITY_CODE=$?
+if [ "$AUTHORITY_CODE" -ne 0 ]; then
+  FINAL_CODE=7
+  FINAL_MSG="Update refused during detached authority revalidation: $AUTHORITY_JSON Nothing was changed."
+  log "$FINAL_MSG"
+  exit "$FINAL_CODE"
+fi
+SNAPSHOT_JSON="$(env PYTHONPATH="$INSTALL_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+  "$AUTHORITY_PY" -m hermes_cli.update_state_snapshot validate \
+  --receipt "$STATE_SNAPSHOT_RECEIPT" --nonce "$AUTHORITY_NONCE" 2>&1)"; SNAPSHOT_CODE=$?
+if [ "$SNAPSHOT_CODE" -ne 0 ]; then
+  FINAL_CODE=7
+  FINAL_MSG="Update refused because the transaction state snapshot no longer validates: $SNAPSHOT_JSON Nothing was changed."
+  log "$FINAL_MSG"
+  exit "$FINAL_CODE"
 fi
 
 # Do not create Chrome until Electron has fully left.  During its 2.5s quit
@@ -754,13 +829,24 @@ if "${UPDATE_INVOKE[@]}" update --help 2>/dev/null | grep -q -- '--keep-stash'; 
 else
   log "installed hermes predates --keep-stash; running without it"
 fi
-log "running: ${UPDATE_INVOKE[*]} update --yes --gateway $KEEP_STASH --branch $BRANCH"
+AUTHORITY_UPDATE_ARGS=(
+  --authority-repo "$INSTALL_ROOT"
+  --authority-remote "$AUTHORITY_REMOTE"
+  --authority-remote-url "$AUTHORITY_REMOTE_URL"
+  --authority-branch "$BRANCH"
+  --authority-tracking-ref "$AUTHORITY_TRACKING_REF"
+  --authority-token "$AUTHORITY_TOKEN"
+  --authority-nonce "$AUTHORITY_NONCE"
+  --authority-owner "$AUTHORITY_OWNER"
+  --state-snapshot-receipt "$STATE_SNAPSHOT_RECEIPT"
+)
+log "running verified authority update: ${UPDATE_INVOKE[*]} update --yes --gateway $KEEP_STASH --branch $BRANCH --authority-remote $AUTHORITY_REMOTE"
 publish_stage "Updating code and dependencies"
-OUT="$("${UPDATE_INVOKE[@]}" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
+OUT="$("${UPDATE_INVOKE[@]}" update --yes --gateway $KEEP_STASH --branch "$BRANCH" "${AUTHORITY_UPDATE_ARGS[@]}" 2>&1)"; CODE=$?
 printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
 log "hermes update exit code: $CODE"
 
-if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
+if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ] && [ -z "$AUTHORITY_TOKEN" ]; then
   # Retry once: update-boundary class (fresh code on disk, stale in memory).
   # Exit 2 ("close all Hermes windows") is not retryable.
   #
@@ -778,7 +864,7 @@ if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
   fi
   log "retrying once (freshly pulled fix loads on the second run)"
   publish_stage "Retrying update"
-  OUT="$("${UPDATE_INVOKE[@]}" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
+  OUT="$("${UPDATE_INVOKE[@]}" update --yes --gateway $KEEP_STASH --branch "$BRANCH" "${AUTHORITY_UPDATE_ARGS[@]}" 2>&1)"; CODE=$?
   printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
   log "retry exit code: $CODE"
 fi

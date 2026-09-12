@@ -236,13 +236,101 @@ def test_handoff_preserves_historical_rollback(bundles):
     assert (historical / "recovery").read_text() == "historical recovery"
 
 
-def test_handoff_launch_acceptance_without_readiness_is_not_success(bundles):
+def test_handoff_without_explicit_authority_refuses_before_result_or_launch(bundles):
     root, _, target = bundles
     completed = shell_handoff(root, target)
-    result = json.loads((root.parent / ".hermes-update-result.json").read_text())
-    assert result["ok"] is False
-    assert result["exit_code"] != 0
+    assert not (root.parent / ".hermes-update-result.json").exists()
     assert completed.returncode != 0
+
+
+def test_adoption_visible_receipt_binds_renderer_backend_bundle_and_nonce(bundles):
+    import time
+
+    update = updater()
+    root, _, target = bundles
+    expected = update.expectation(root)
+    hashes = update.validate(target, expected)
+    authority = {
+        "repo": str(root.resolve()),
+        "remote": "fork",
+        "remote_url": "https://example.invalid/fork.git",
+        "branch": "codex/hermes-live-current",
+        "tracking_ref": "refs/remotes/fork/codex/hermes-live-current",
+    }
+    launched_at = time.time() - 1
+    main_start = (int(launched_at), 0)
+    main = update.Process(101, main_start, 1, target / "Contents/MacOS/Hermes")
+    renderer_path = target / (
+        "Contents/Frameworks/Hermes Helper (Renderer).app/Contents/MacOS/"
+        "Hermes Helper (Renderer)"
+    )
+    renderer = update.Process(102, (1, 2), 101, renderer_path)
+    tree = {101: main, 102: renderer, 103: update.Process(103, (1, 3), 101, None)}
+    receipt_path = root.parent / ".hermes-update-visible-receipt.json"
+    receipt = {
+        "schema_version": 1,
+        "nonce": "visible-nonce",
+        "authority": authority,
+        "expected_commit": expected["sha"],
+        "bundle": str(target),
+        "stamp_sha256": hashes.stamp,
+        "app_pid": 101,
+        "app_start_epoch_ms": main_start[0] * 1000,
+        "renderer_pid": 102,
+        "backend_pid": 103,
+        "backend_port": 7777,
+        "backend_mode": "local",
+        "visible": True,
+        "focused": True,
+        "recorded_at": time.time(),
+    }
+    receipt_path.write_text(json.dumps(receipt))
+    update.verify_visible_receipt(
+        root, target, "visible-nonce", authority, expected, hashes,
+        main, tree, ("local", 7777, 103, (1, 3)), launched_at,
+    )
+    receipt["backend_pid"] = 102
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(RuntimeError, match="backend identity"):
+        update.verify_visible_receipt(
+            root, target, "visible-nonce", authority, expected, hashes,
+            main, tree, ("local", 7777, 103, (1, 3)), launched_at,
+        )
+
+    receipt["backend_pid"] = 103
+    receipt["visible"] = False
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(RuntimeError, match="visible-window receipt"):
+        update.verify_visible_receipt(
+            root, target, "visible-nonce", authority, expected, hashes,
+            main, tree, ("local", 7777, 103, (1, 3)), launched_at,
+        )
+
+
+def test_failed_update_publishes_failure_before_old_shell_relaunch(bundles, monkeypatch):
+    update = updater()
+    root, _, target = bundles
+    authority = {
+        "repo": str(root.resolve()),
+        "remote": "fork",
+        "remote_url": "https://example.invalid/fork.git",
+        "branch": "codex/hermes-live-current",
+        "tracking_ref": "refs/remotes/fork/codex/hermes-live-current",
+    }
+    result_path = root.parent / ".hermes-update-result.json"
+
+    def assert_failure_was_published(*args, **kwargs):
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        assert result["ok"] is False
+        assert result["exit_code"] == 8
+        assert result["transaction_nonce"] == "failure-nonce"
+
+    monkeypatch.setattr(update, "adopt", assert_failure_was_published)
+    outcome = update.complete(
+        root, target, authority["branch"], 0, 8, "forced failure",
+        nonce="failure-nonce", authority=authority,
+    )
+    assert outcome.code == 8
 
 
 @pytest.mark.parametrize("reader", ["main", "helper", "renderer", "mapped-only"])
