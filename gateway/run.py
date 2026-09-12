@@ -1533,7 +1533,12 @@ def _reload_runtime_env_preserving_config_authority() -> None:
 
 
 def _bridge_max_turns_from_config(home: "Path") -> None:
-    """Re-bridge agent.max_turns (+ sessions.*) per turn; managed overlay applies or it reverts."""
+    """Re-bridge agent.max_turns (+ sessions.*) per turn; managed overlay applies or it reverts.
+    Skipped inside a served secondary's scope: the env slots are the launch profile's and
+    hermes_state reads the routed profile's ``sessions.*`` from its own config under scope."""
+    from gateway.platforms._shared import profile_scoped
+    if profile_scoped():
+        return
     config_path = home / 'config.yaml'
     if not config_path.exists():
         return
@@ -1548,9 +1553,20 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
 def _current_max_iterations() -> int:
     """Return the per-turn iteration budget after runtime env refresh; ``resolve_turn_limit`` maps
     ``agent.max_turns: none``/``unlimited`` (bridged as a string) to the unlimited sentinel, not an
-    ``int()`` crash."""
+    ``int()`` crash. A routed profile (HERMES_HOME override, multiplexed turns) reads ITS
+    ``agent.max_turns`` straight from config: the ``HERMES_MAX_ITERATIONS`` bridge is one process-wide
+    slot holding the launch profile's value, so every secondary would inherit the default's budget."""
     _reload_runtime_env_preserving_config_authority()
     from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
+    override = get_hermes_home_override()
+    if override:
+        config_path = Path(override) / 'config.yaml'
+        try:
+            cfg = _load_bridge_config(config_path) if config_path.exists() else {}
+        except Exception:
+            cfg = {}
+        agent_cfg = cfg.get("agent")
+        return _resolve_turn_limit(agent_cfg.get("max_turns") if isinstance(agent_cfg, dict) else None)
     return _resolve_turn_limit(os.getenv("HERMES_MAX_ITERATIONS"))
 
 
@@ -1575,15 +1591,14 @@ class HygieneTurnHoldExceeded(Exception):
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Return the authoritative profile set for one multiplex gateway config."""
     from hermes_cli.profiles import profiles_to_serve
-    return list(profiles_to_serve(
-        multiplex=True, profile_allowlist=getattr(config, "multiplex_profile_allowlist", None)))
+    return list(profiles_to_serve(multiplex=True))
 
 
 def _cron_tick_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Profile homes the in-process ticker visits under multiplex: the served set PLUS the
-    process-active profile. ``profiles_to_serve`` starts at default + allowlist, so a
-    ``--profile <name>`` multiplexer was omitted unless allowlisted — and allowlisting it would
-    start a second adapter on its own bot token. Adapter startup already skips ``active``."""
+    process-active profile: ``profiles_to_serve`` lists default + every live named profile, but a
+    ``--profile <name>`` multiplexer's own profile may sit outside ``profiles/`` (custom
+    HERMES_HOME). Adapter startup already skips ``active``."""
     from hermes_cli.profiles import get_active_profile_name, get_profile_dir
 
     homes = _multiplex_profile_homes(config)
@@ -3599,10 +3614,11 @@ class GatewayRunner(
         # ``pairing_store``: global/default store (CLI, callers without profile context); ``pairing_stores``:
         # per-profile map ``authz_mixin._is_user_authorized`` routes through (one whitelist per profile).
         from gateway.pairing import PairingStore
-        from gateway.hooks import HookRegistry
+        from gateway.hooks import ProfileHookRegistries
         self.pairing_store = PairingStore()
         self.pairing_stores: Dict[str, "PairingStore"] = {}
-        self.hooks = HookRegistry()
+        # One HookRegistry per served profile home, resolved from the active scope at emit time.
+        self.hooks = ProfileHookRegistries()
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
         # Per-(guild,user) transcript dedup: the voice/STT pipeline can emit one utterance twice.
