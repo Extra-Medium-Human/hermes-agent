@@ -49,6 +49,22 @@ export function parseUpdateAuthorityConfig(value: unknown, expectedRepo: string)
   return { ok: true, authority: { repo: path.resolve(repo), remote, remoteUrl, branch, trackingRef } }
 }
 
+function quotePowerShellArgument(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+export function authorityBoundManualUpdateCommand(authority: UpdateAuthority): string {
+  return [
+    'hermes update',
+    '--branch', quotePowerShellArgument(authority.branch),
+    '--authority-repo', quotePowerShellArgument(authority.repo),
+    '--authority-remote', quotePowerShellArgument(authority.remote),
+    '--authority-remote-url', quotePowerShellArgument(authority.remoteUrl),
+    '--authority-branch', quotePowerShellArgument(authority.branch),
+    '--authority-tracking-ref', quotePowerShellArgument(authority.trackingRef)
+  ].join(' ')
+}
+
 export function authorityPreflightInvocation(
   python: string,
   authority: UpdateAuthority,
@@ -122,7 +138,7 @@ export function parseHandoffReadiness(
     head: string
     remoteTip: string
   }
-): { ok: true; helperPid: number } | AuthorityRefusal {
+): { ok: true; helperPid: number; helperStartIdentity: string } | AuthorityRefusal {
   try {
     const parsed = JSON.parse(raw)
     if (parsed?.ok === false && typeof parsed.code === 'string' && typeof parsed.message === 'string') {
@@ -133,13 +149,19 @@ export function parseHandoffReadiness(
       parsed.owner_pid === expected.ownerPid &&
       Number.isInteger(parsed.helper_pid) &&
       parsed.helper_pid > 0 &&
+      typeof parsed.helper_start_identity === 'string' &&
+      /^(linux|ps):.+/.test(parsed.helper_start_identity) &&
       parsed.nonce === expected.nonce &&
       parsed.topology === 'behind' &&
       parsed.head === expected.head &&
       parsed.remote_tip === expected.remoteTip &&
       JSON.stringify(parsed.authority) === JSON.stringify(expected.authority)
     ) {
-      return { ok: true, helperPid: parsed.helper_pid }
+      return {
+        ok: true,
+        helperPid: parsed.helper_pid,
+        helperStartIdentity: parsed.helper_start_identity
+      }
     }
   } catch {
     void 0
@@ -148,5 +170,28 @@ export function parseHandoffReadiness(
     ok: false,
     code: 'HANDOFF_TOKEN_MISMATCH',
     message: 'Detached updater readiness did not match this update transaction.'
+  }
+}
+
+export async function verifyHandoffHelperBeforeQuit(
+  readiness: { helperPid: number; helperStartIdentity: string },
+  processStartIdentity: (pid: number) => Promise<string>
+): Promise<{ ok: true } | AuthorityRefusal> {
+  try {
+    const current = await processStartIdentity(readiness.helperPid)
+    if (current === readiness.helperStartIdentity) {
+      return { ok: true }
+    }
+    return {
+      ok: false,
+      code: 'HANDOFF_HELPER_REUSED',
+      message: 'Detached updater PID no longer identifies the ready helper; Hermes stayed open.'
+    }
+  } catch {
+    return {
+      ok: false,
+      code: 'HANDOFF_HELPER_UNVERIFIED',
+      message: 'Detached updater liveness could not be verified; Hermes stayed open.'
+    }
   }
 }

@@ -217,6 +217,60 @@ def test_untracked_path_colliding_with_remote_delta_refuses(tmp_path: Path) -> N
     assert "?? future.txt" in git(checkout, "status", "--porcelain")
 
 
+def test_tracked_rename_source_colliding_with_remote_delta_refuses(tmp_path: Path) -> None:
+    from hermes_cli.update_authority import AuthorityRefusal, UpdateAuthority, probe_authority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    git(checkout, "mv", "tracked.txt", "renamed.txt")
+    advance_remote(tmp_path, remote, branch, path="tracked.txt")
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+
+    with pytest.raises(AuthorityRefusal) as raised:
+        probe_authority(authority, nonce="nonce-rename-source")
+
+    assert raised.value.code == "DIRTY_COLLISION"
+    assert not (checkout / "tracked.txt").exists()
+    assert (checkout / "renamed.txt").read_bytes() == b"one\n"
+
+
+@pytest.mark.parametrize(
+    ("dirty_path", "remote_path"),
+    [
+        ("slot/child.txt", "slot"),
+        ("slot", "slot/child.txt"),
+    ],
+)
+def test_untracked_parent_child_collision_refuses_directory_file_conversion(
+    tmp_path: Path, dirty_path: str, remote_path: str
+) -> None:
+    from hermes_cli.update_authority import AuthorityRefusal, UpdateAuthority, probe_authority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    advance_remote(tmp_path, remote, branch, path=remote_path)
+    dirty = checkout / dirty_path
+    dirty.parent.mkdir(parents=True, exist_ok=True)
+    dirty.write_bytes(b"local untracked bytes\n")
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+
+    with pytest.raises(AuthorityRefusal) as raised:
+        probe_authority(authority, nonce="nonce-structural-collision")
+
+    assert raised.value.code == "DIRTY_COLLISION"
+    assert dirty.read_bytes() == b"local untracked bytes\n"
+
+
 def test_fast_forward_preserves_noncolliding_tracked_deletion(tmp_path: Path) -> None:
     from hermes_cli.update_authority import UpdateAuthority, apply_fast_forward, probe_authority
 

@@ -6,11 +6,14 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
+import unicodedata
 from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,9 @@ class DirtyEntry:
     status: str
     mode: int
     sha256: str
+    source_path: str | None = None
+    source_mode: int | None = None
+    source_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,33 @@ def _git(authority: UpdateAuthority, *args: str) -> subprocess.CompletedProcess[
     )
 
 
+def _path_identity(
+    authority: UpdateAuthority, relpath: str, *, absent_allowed: bool
+) -> tuple[int, str]:
+    path = authority.repo / relpath
+    try:
+        info = path.lstat()
+        mode = info.st_mode & 0o7777
+        if path.is_symlink():
+            data = os.fsencode(os.readlink(path))
+        elif path.is_file():
+            data = path.read_bytes()
+        else:
+            data = b""
+    except FileNotFoundError as exc:
+        if not absent_allowed:
+            raise AuthorityRefusal(
+                "DIRTY_UNVERIFIED", f"dirty path identity unavailable: {relpath}"
+            ) from exc
+        mode = 0
+        data = b""
+    except OSError as exc:
+        raise AuthorityRefusal(
+            "DIRTY_UNVERIFIED", f"dirty path identity unavailable: {relpath}"
+        ) from exc
+    return mode, hashlib.sha256(data).hexdigest()
+
+
 def _dirty_manifest(authority: UpdateAuthority) -> tuple[DirtyEntry, ...]:
     result = _git(authority, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     if result.returncode:
@@ -104,32 +137,32 @@ def _dirty_manifest(authority: UpdateAuthority) -> tuple[DirtyEntry, ...]:
         if len(field) < 4 or field[2] != " ":
             raise AuthorityRefusal("DIRTY_UNVERIFIED", "working tree status was malformed")
         status, relpath = field[:2], field[3:]
+        source_path = None
         if "R" in status or "C" in status:
             if index >= len(fields) or not fields[index]:
                 raise AuthorityRefusal("DIRTY_UNVERIFIED", "rename status was malformed")
+            source_path = fields[index]
             index += 1
-        path = authority.repo / relpath
-        try:
-            info = path.lstat()
-            mode = info.st_mode & 0o7777
-            if path.is_symlink():
-                data = os.fsencode(os.readlink(path))
-            elif path.is_file():
-                data = path.read_bytes()
-            else:
-                data = b""
-        except FileNotFoundError as exc:
-            if "D" not in status:
-                raise AuthorityRefusal(
-                    "DIRTY_UNVERIFIED", f"dirty path identity unavailable: {relpath}"
-                ) from exc
-            # A tracked deletion has a stable identity too: the path must stay
-            # absent across the fast-forward. Bind that absence explicitly.
-            mode = 0
-            data = b""
-        except OSError as exc:
-            raise AuthorityRefusal("DIRTY_UNVERIFIED", f"dirty path identity unavailable: {relpath}") from exc
-        entries.append(DirtyEntry(relpath, status, mode, hashlib.sha256(data).hexdigest()))
+        mode, digest = _path_identity(authority, relpath, absent_allowed="D" in status)
+        source_mode = None
+        source_digest = None
+        if source_path is not None:
+            # A rename binds the absent old path; a copy binds the still-present
+            # source. Both identities participate in collision and stale checks.
+            source_mode, source_digest = _path_identity(
+                authority, source_path, absent_allowed="R" in status
+            )
+        entries.append(
+            DirtyEntry(
+                relpath,
+                status,
+                mode,
+                digest,
+                source_path,
+                source_mode,
+                source_digest,
+            )
+        )
     return tuple(sorted(entries, key=lambda entry: entry.path))
 
 
@@ -138,6 +171,40 @@ def _remote_delta(authority: UpdateAuthority, head: str, remote_tip: str) -> set
     if result.returncode:
         raise AuthorityRefusal("AUTHORITY_UNVERIFIED", "remote delta could not be read")
     return {path for path in result.stdout.split("\0") if path}
+
+
+def _normalized_git_path(value: str) -> str:
+    """Normalize a repo-relative Git path for structural collision checks."""
+    normalized = unicodedata.normalize("NFC", PurePosixPath(value).as_posix())
+    if os.path.normcase("A") == os.path.normcase("a"):
+        normalized = normalized.casefold()
+    return normalized.removeprefix("./").rstrip("/")
+
+
+def _paths_collide(left: str, right: str) -> bool:
+    left_path = _normalized_git_path(left)
+    right_path = _normalized_git_path(right)
+    return (
+        left_path == right_path
+        or left_path.startswith(f"{right_path}/")
+        or right_path.startswith(f"{left_path}/")
+    )
+
+
+def _dirty_collision_paths(
+    manifest: tuple[DirtyEntry, ...], remote_delta: set[str]
+) -> list[str]:
+    identities = {
+        identity
+        for entry in manifest
+        for identity in (entry.path, entry.source_path)
+        if identity
+    }
+    return sorted(
+        identity
+        for identity in identities
+        if any(_paths_collide(identity, remote_path) for remote_path in remote_delta)
+    )
 
 
 def probe_authority(authority: UpdateAuthority, *, nonce: str) -> AuthorityProbe:
@@ -180,7 +247,9 @@ def probe_authority(authority: UpdateAuthority, *, nonce: str) -> AuthorityProbe
         raise AuthorityRefusal("AUTHORITY_UNVERIFIED", "authority objects could not be resolved")
     head, remote_tip = head_result.stdout.strip(), tip_result.stdout.strip()
     manifest = _dirty_manifest(authority)
-    collisions = sorted({entry.path for entry in manifest} & _remote_delta(authority, head, remote_tip))
+    collisions = _dirty_collision_paths(
+        manifest, _remote_delta(authority, head, remote_tip)
+    )
     if collisions:
         raise AuthorityRefusal("DIRTY_COLLISION", f"dirty paths collide with update: {', '.join(collisions)}")
     if head == remote_tip:
@@ -302,6 +371,47 @@ def _authority_from_args(args) -> UpdateAuthority:
     )
 
 
+def process_start_identity(pid: int) -> str:
+    """Return the canonical Desktop PID-reuse-resistant process identity."""
+    if pid <= 0:
+        raise AuthorityRefusal("HANDOFF_HELPER_UNVERIFIED", "helper pid is invalid")
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            fields = stat[stat.rfind(")") + 1 :].strip().split()
+            started = fields[19]
+        except (OSError, IndexError, UnicodeError) as exc:
+            raise AuthorityRefusal(
+                "HANDOFF_HELPER_UNVERIFIED",
+                "helper process start identity is unavailable",
+            ) from exc
+        if not started.isdigit():
+            raise AuthorityRefusal(
+                "HANDOFF_HELPER_UNVERIFIED",
+                "helper process start identity is malformed",
+            )
+        return f"linux:{started}"
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        started = result.stdout.strip()
+        if result.returncode or not started:
+            raise AuthorityRefusal(
+                "HANDOFF_HELPER_UNVERIFIED",
+                "helper process start identity is unavailable",
+            )
+        return f"ps:{started}"
+    raise AuthorityRefusal(
+        "HANDOFF_HELPER_UNVERIFIED",
+        "helper process start identity is unsupported",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -318,6 +428,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token", type=Path)
     args = parser.parse_args(argv)
     authority = _authority_from_args(args)
+    helper_pid = 0
+    helper_start_identity = ""
     try:
         if args.action in {"check", "preflight"}:
             probe = probe_authority(authority, nonce=args.nonce)
@@ -334,6 +446,8 @@ def main(argv: list[str] | None = None) -> int:
                 owner_pid=args.owner,
                 nonce=args.nonce,
             )
+            helper_pid = args.helper or os.getpid()
+            helper_start_identity = process_start_identity(helper_pid)
     except AuthorityRefusal as exc:
         print(json.dumps({"ok": False, "code": exc.code, "message": str(exc)}, sort_keys=True))
         return 2
@@ -346,7 +460,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "validate":
         output.update(
             owner_pid=args.owner,
-            helper_pid=args.helper or os.getpid(),
+            helper_pid=helper_pid,
+            helper_start_identity=helper_start_identity,
             nonce=args.nonce,
             authority={
                 "repo": str(authority.repo.resolve()),
