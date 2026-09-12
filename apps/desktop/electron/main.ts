@@ -4184,17 +4184,53 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
   }
 }
 
+async function classifyWindowsBootstrapMode(updateRoot, canonicalActiveRoot = updateRoot) {
+  const candidates = [...new Set([updateRoot, canonicalActiveRoot].filter(Boolean))]
+  for (const candidate of candidates) {
+    try {
+      fs.lstatSync(candidate)
+      return {
+        ok: true,
+        mode: 'managed-checkout-recovery',
+        evidence: `install or checkout root exists at ${candidate}`
+      }
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        continue
+      }
+      return {
+        ok: false,
+        code: 'BOOTSTRAP_INSTALL_STATE_UNVERIFIED',
+        message: `Hermes could not verify whether ${candidate} is a fresh install or managed recovery; Hermes stayed open.`
+      }
+    }
+  }
+  return {
+    ok: true,
+    mode: 'fresh-install',
+    evidence: `resolved and canonical install roots are absent (${candidates.join(', ')})`
+  }
+}
+
 async function handOffWindowsBootstrapRecovery(reason) {
   if (!IS_WINDOWS || !IS_PACKAGED) {
     return false
   }
 
-  const updater = resolveUpdaterBinary()
-  if (!updater) {
+  // Generic bootstrap is legal only when the resolved install/checkout root is
+  // verifiably absent. Any existing checkout shape, including a damaged or
+  // partial one, is managed recovery and must validate its authority first.
+  const updateRoot = resolveUpdateRoot()
+  const bootstrapMode = await classifyWindowsBootstrapMode(updateRoot, ACTIVE_HERMES_ROOT)
+  if (bootstrapMode.ok === false) {
+    rememberLog(`[bootstrap] refusing Windows recovery [${bootstrapMode.code}]: ${bootstrapMode.message}`)
+    return bootstrapMode
+  }
+  if (bootstrapMode.mode === 'fresh-install') {
+    rememberLog(`[bootstrap] verified fresh Windows install: ${bootstrapMode.evidence}`)
     return false
   }
 
-  const updateRoot = resolveUpdateRoot()
   const authorityResult = configuredUpdateAuthority(updateRoot)
   if (authorityResult.ok === false) {
     rememberLog(`[bootstrap] refusing Windows recovery [${authorityResult.code}]: ${authorityResult.message}`)
@@ -4211,9 +4247,23 @@ async function handOffWindowsBootstrapRecovery(reason) {
     rememberLog(`[bootstrap] refusing Windows recovery [${probed.code}]: ${probed.message}`)
     return probed
   }
+
+  // Resolve the staged updater only after the managed checkout and its complete
+  // authority are verified. Absence is a recovery refusal, never permission to
+  // enter the authority-free fresh-install bootstrap.
+  const updater = resolveUpdaterBinary()
+  if (!updater) {
+    const message = 'The managed Windows install has no staged recovery updater; Hermes stayed open.'
+    rememberLog('[bootstrap] refusing Windows recovery [WINDOWS_UPDATER_MISSING]: staged updater is absent')
+    return { ok: false, code: 'WINDOWS_UPDATER_MISSING', message }
+  }
+
   if (probed.topology === 'equal') {
-    rememberLog(`[bootstrap] authority is already current; continuing in-process ${reason} repair`)
-    return false
+    const message =
+      `The managed Windows install is current but ${reason} repair cannot use the generic fresh-install bootstrap; ` +
+      'Hermes stayed open.'
+    rememberLog('[bootstrap] refusing current managed Windows recovery: generic bootstrap is fresh-install only')
+    return { ok: false, code: 'WINDOWS_MANAGED_RECOVERY_UNSUPPORTED', message }
   }
 
   // The staged installer cannot carry and revalidate the full configured

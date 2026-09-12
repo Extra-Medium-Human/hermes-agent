@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import uuid
 from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,12 +123,78 @@ def _path_identity(
     return mode, hashlib.sha256(data).hexdigest()
 
 
+def _head_blob_paths(authority: UpdateAuthority) -> dict[str, list[str]]:
+    result = _git(authority, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+    if result.returncode:
+        raise AuthorityRefusal("DIRTY_UNVERIFIED", "HEAD copy sources could not be read")
+    paths_by_blob: dict[str, list[str]] = {}
+    for record in result.stdout.split("\0"):
+        if not record:
+            continue
+        try:
+            metadata, relpath = record.split("\t", 1)
+            _mode, object_type, object_id = metadata.split(" ", 2)
+        except ValueError as exc:
+            raise AuthorityRefusal("DIRTY_UNVERIFIED", "HEAD copy source data was malformed") from exc
+        if object_type == "blob":
+            paths_by_blob.setdefault(object_id, []).append(relpath)
+    return paths_by_blob
+
+
+def _index_copy_sources(authority: UpdateAuthority) -> dict[str, str]:
+    """Return exact staged copy destinations and their unique HEAD sources."""
+    result = _git(
+        authority,
+        "diff",
+        "--cached",
+        "--name-status",
+        "-z",
+        "--find-copies-harder",
+        "--find-copies=100%",
+        "HEAD",
+        "--",
+    )
+    if result.returncode:
+        raise AuthorityRefusal("DIRTY_UNVERIFIED", "staged copy state could not be read")
+    fields = result.stdout.split("\0")
+    detected: dict[str, str] = {}
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        index += 1
+        if not status:
+            continue
+        path_count = 2 if status.startswith(("C", "R")) else 1
+        if index + path_count > len(fields) or any(not value for value in fields[index : index + path_count]):
+            raise AuthorityRefusal("DIRTY_UNVERIFIED", "staged copy state was malformed")
+        paths = fields[index : index + path_count]
+        index += path_count
+        if status == "C100":
+            source_path, destination_path = paths
+            detected[destination_path] = source_path
+
+    if not detected:
+        return {}
+
+    paths_by_blob = _head_blob_paths(authority)
+    for destination_path, detected_source in detected.items():
+        blob = _git(authority, "rev-parse", f":{destination_path}")
+        if blob.returncode or not blob.stdout.strip():
+            raise AuthorityRefusal("DIRTY_UNVERIFIED", f"staged copy identity unavailable: {destination_path}")
+        candidates = paths_by_blob.get(blob.stdout.strip(), [])
+        if len(candidates) != 1 or candidates[0] != detected_source:
+            raise AuthorityRefusal("DIRTY_UNVERIFIED", f"staged copy source is ambiguous: {destination_path}")
+    return detected
+
+
 def _dirty_manifest(authority: UpdateAuthority) -> tuple[DirtyEntry, ...]:
     result = _git(authority, "status", "--porcelain=v1", "-z", "--untracked-files=all")
     if result.returncode:
         raise AuthorityRefusal("DIRTY_UNVERIFIED", "working tree state could not be read")
     fields = result.stdout.split("\0")
+    copy_sources = _index_copy_sources(authority)
     entries: list[DirtyEntry] = []
+    represented_copy_destinations: set[str] = set()
     index = 0
     while index < len(fields):
         field = fields[index]
@@ -137,12 +204,17 @@ def _dirty_manifest(authority: UpdateAuthority) -> tuple[DirtyEntry, ...]:
         if len(field) < 4 or field[2] != " ":
             raise AuthorityRefusal("DIRTY_UNVERIFIED", "working tree status was malformed")
         status, relpath = field[:2], field[3:]
-        source_path = None
+        source_path = copy_sources.get(relpath)
         if "R" in status or "C" in status:
             if index >= len(fields) or not fields[index]:
                 raise AuthorityRefusal("DIRTY_UNVERIFIED", "rename status was malformed")
-            source_path = fields[index]
+            porcelain_source = fields[index]
             index += 1
+            if source_path is not None and source_path != porcelain_source:
+                raise AuthorityRefusal("DIRTY_UNVERIFIED", "copy source attribution changed")
+            source_path = porcelain_source
+        if relpath in copy_sources:
+            represented_copy_destinations.add(relpath)
         mode, digest = _path_identity(authority, relpath, absent_allowed="D" in status)
         source_mode = None
         source_digest = None
@@ -163,6 +235,8 @@ def _dirty_manifest(authority: UpdateAuthority) -> tuple[DirtyEntry, ...]:
                 source_digest,
             )
         )
+    if represented_copy_destinations != set(copy_sources):
+        raise AuthorityRefusal("DIRTY_UNVERIFIED", "staged copy destination was missing from status")
     return tuple(sorted(entries, key=lambda entry: entry.path))
 
 
@@ -173,17 +247,51 @@ def _remote_delta(authority: UpdateAuthority, head: str, remote_tip: str) -> set
     return {path for path in result.stdout.split("\0") if path}
 
 
-def _normalized_git_path(value: str) -> str:
+def _probe_filesystem_case_sensitive(authority: UpdateAuthority) -> bool:
+    """Probe case behavior on the checkout filesystem without leaving state."""
+    stem = f".hermes-case-probe-{uuid.uuid4().hex}"
+    lower_path = authority.repo / f"{stem}a"
+    upper_path = authority.repo / f"{stem}A"
+    result: bool | None = None
+    error: OSError | None = None
+    try:
+        lower_fd = os.open(lower_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(lower_fd)
+        try:
+            upper_fd = os.open(upper_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if not os.path.samefile(lower_path, upper_path):
+                raise OSError("case probe paths collided without identifying the same file")
+            result = False
+        else:
+            os.close(upper_fd)
+            result = True
+    except OSError as exc:
+        error = exc
+    finally:
+        for candidate in (upper_path, lower_path):
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                error = error or exc
+    if error is not None or result is None:
+        raise AuthorityRefusal("DIRTY_UNVERIFIED", "checkout filesystem case behavior could not be verified") from error
+    return result
+
+
+def _normalized_git_path(value: str, *, case_sensitive: bool) -> str:
     """Normalize a repo-relative Git path for structural collision checks."""
     normalized = unicodedata.normalize("NFC", PurePosixPath(value).as_posix())
-    if os.path.normcase("A") == os.path.normcase("a"):
+    if not case_sensitive:
         normalized = normalized.casefold()
     return normalized.removeprefix("./").rstrip("/")
 
 
-def _paths_collide(left: str, right: str) -> bool:
-    left_path = _normalized_git_path(left)
-    right_path = _normalized_git_path(right)
+def _paths_collide(left: str, right: str, *, case_sensitive: bool) -> bool:
+    left_path = _normalized_git_path(left, case_sensitive=case_sensitive)
+    right_path = _normalized_git_path(right, case_sensitive=case_sensitive)
     return (
         left_path == right_path
         or left_path.startswith(f"{right_path}/")
@@ -192,7 +300,7 @@ def _paths_collide(left: str, right: str) -> bool:
 
 
 def _dirty_collision_paths(
-    manifest: tuple[DirtyEntry, ...], remote_delta: set[str]
+    manifest: tuple[DirtyEntry, ...], remote_delta: set[str], *, case_sensitive: bool
 ) -> list[str]:
     identities = {
         identity
@@ -203,7 +311,7 @@ def _dirty_collision_paths(
     return sorted(
         identity
         for identity in identities
-        if any(_paths_collide(identity, remote_path) for remote_path in remote_delta)
+        if any(_paths_collide(identity, remote_path, case_sensitive=case_sensitive) for remote_path in remote_delta)
     )
 
 
@@ -246,9 +354,12 @@ def probe_authority(authority: UpdateAuthority, *, nonce: str) -> AuthorityProbe
     if head_result.returncode or tip_result.returncode:
         raise AuthorityRefusal("AUTHORITY_UNVERIFIED", "authority objects could not be resolved")
     head, remote_tip = head_result.stdout.strip(), tip_result.stdout.strip()
+    case_sensitive = _probe_filesystem_case_sensitive(authority)
     manifest = _dirty_manifest(authority)
     collisions = _dirty_collision_paths(
-        manifest, _remote_delta(authority, head, remote_tip)
+        manifest,
+        _remote_delta(authority, head, remote_tip),
+        case_sensitive=case_sensitive,
     )
     if collisions:
         raise AuthorityRefusal("DIRTY_COLLISION", f"dirty paths collide with update: {', '.join(collisions)}")

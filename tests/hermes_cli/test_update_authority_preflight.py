@@ -239,6 +239,103 @@ def test_tracked_rename_source_colliding_with_remote_delta_refuses(tmp_path: Pat
     assert (checkout / "renamed.txt").read_bytes() == b"one\n"
 
 
+def test_staged_copy_source_colliding_with_remote_delta_refuses(tmp_path: Path) -> None:
+    from hermes_cli.update_authority import AuthorityRefusal, UpdateAuthority, probe_authority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    (checkout / "copy.txt").write_bytes((checkout / "tracked.txt").read_bytes())
+    git(checkout, "add", "copy.txt")
+    assert git(checkout, "status", "--porcelain") == "A  copy.txt"
+    advance_remote(tmp_path, remote, branch, path="tracked.txt")
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+
+    with pytest.raises(AuthorityRefusal) as raised:
+        probe_authority(authority, nonce="nonce-copy-source")
+
+    assert raised.value.code == "DIRTY_COLLISION"
+    assert (checkout / "tracked.txt").read_bytes() == b"one\n"
+    assert (checkout / "copy.txt").read_bytes() == b"one\n"
+
+
+def test_staged_copy_destination_colliding_with_remote_delta_refuses(tmp_path: Path) -> None:
+    from hermes_cli.update_authority import AuthorityRefusal, UpdateAuthority, probe_authority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    (checkout / "copy.txt").write_bytes((checkout / "tracked.txt").read_bytes())
+    git(checkout, "add", "copy.txt")
+    advance_remote(tmp_path, remote, branch, path="copy.txt")
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+
+    with pytest.raises(AuthorityRefusal) as raised:
+        probe_authority(authority, nonce="nonce-copy-destination")
+
+    assert raised.value.code == "DIRTY_COLLISION"
+    assert (checkout / "copy.txt").read_bytes() == b"one\n"
+
+
+def test_noncolliding_staged_copy_is_preserved_across_fast_forward(tmp_path: Path) -> None:
+    from hermes_cli.update_authority import UpdateAuthority, apply_fast_forward, probe_authority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    (checkout / "copy.txt").write_bytes((checkout / "tracked.txt").read_bytes())
+    git(checkout, "add", "copy.txt")
+    remote_tip = advance_remote(tmp_path, remote, branch, path="remote-only.txt")
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+
+    probe = probe_authority(authority, nonce="nonce-copy-preserve")
+
+    assert probe.topology == "behind"
+    copy_entry = next(entry for entry in probe.dirty_manifest if entry.path == "copy.txt")
+    assert copy_entry.status == "A "
+    assert copy_entry.source_path == "tracked.txt"
+    assert apply_fast_forward(probe) == remote_tip
+    assert (checkout / "tracked.txt").read_bytes() == b"one\n"
+    assert (checkout / "copy.txt").read_bytes() == b"one\n"
+    assert git(checkout, "status", "--porcelain") == "A  copy.txt"
+
+
+def test_ambiguous_staged_copy_source_refuses_as_unverified(tmp_path: Path) -> None:
+    from hermes_cli.update_authority import AuthorityRefusal, UpdateAuthority, probe_authority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    (checkout / "second-source.txt").write_bytes((checkout / "tracked.txt").read_bytes())
+    git(checkout, "add", "second-source.txt")
+    git(checkout, "commit", "-m", "add duplicate source")
+    git(checkout, "push", "fork", branch)
+    (checkout / "copy.txt").write_bytes((checkout / "tracked.txt").read_bytes())
+    git(checkout, "add", "copy.txt")
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+
+    with pytest.raises(AuthorityRefusal) as raised:
+        probe_authority(authority, nonce="nonce-copy-ambiguous")
+
+    assert raised.value.code == "DIRTY_UNVERIFIED"
+
+
 @pytest.mark.parametrize(
     ("dirty_path", "remote_path"),
     [
@@ -269,6 +366,113 @@ def test_untracked_parent_child_collision_refuses_directory_file_conversion(
 
     assert raised.value.code == "DIRTY_COLLISION"
     assert dirty.read_bytes() == b"local untracked bytes\n"
+
+
+@pytest.mark.parametrize(
+    ("dirty_path", "remote_path"),
+    [
+        ("FUTURE.txt", "future.txt"),
+        ("Slot/child.txt", "slot"),
+        ("Slot", "slot/child.txt"),
+    ],
+)
+def test_actual_case_insensitive_checkout_refuses_case_variant_collisions(
+    tmp_path: Path, dirty_path: str, remote_path: str
+) -> None:
+    from hermes_cli.update_authority import (
+        AuthorityRefusal,
+        UpdateAuthority,
+        _probe_filesystem_case_sensitive,
+        probe_authority,
+    )
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+    if _probe_filesystem_case_sensitive(authority):
+        pytest.skip("requires a case-insensitive checkout filesystem")
+    advance_remote(tmp_path, remote, branch, path=remote_path)
+    dirty = checkout / dirty_path
+    dirty.parent.mkdir(parents=True, exist_ok=True)
+    dirty.write_bytes(b"local case-variant bytes\n")
+
+    with pytest.raises(AuthorityRefusal) as raised:
+        probe_authority(authority, nonce="nonce-case-insensitive")
+
+    assert raised.value.code == "DIRTY_COLLISION"
+    assert dirty.read_bytes() == b"local case-variant bytes\n"
+
+
+def test_case_sensitive_probe_result_keeps_case_distinct_paths_noncolliding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_cli import update_authority as module
+    from hermes_cli.update_authority import UpdateAuthority, probe_authority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    remote_tip = advance_remote(tmp_path, remote, branch, path="future.txt")
+    (checkout / "FUTURE.txt").write_bytes(b"local case-distinct bytes\n")
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+    monkeypatch.setattr(module, "_probe_filesystem_case_sensitive", lambda _authority: True)
+
+    probe = probe_authority(authority, nonce="nonce-case-sensitive-control")
+
+    assert probe.topology == "behind"
+    assert probe.remote_tip == remote_tip
+    assert (checkout / "FUTURE.txt").read_bytes() == b"local case-distinct bytes\n"
+
+
+def test_case_probe_error_refuses_and_cleans_probe_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_cli import update_authority as module
+    from hermes_cli.update_authority import AuthorityRefusal, UpdateAuthority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+    real_open = module.os.open
+    calls = 0
+
+    def failing_second_open(path, flags, mode=0o777):
+        nonlocal calls
+        if str(path).startswith(str(checkout / ".hermes-case-probe-")):
+            calls += 1
+            if calls == 2:
+                raise PermissionError("case probe denied")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(module.os, "open", failing_second_open)
+
+    with pytest.raises(AuthorityRefusal) as raised:
+        module._probe_filesystem_case_sensitive(authority)
+
+    assert raised.value.code == "DIRTY_UNVERIFIED"
+    assert list(checkout.glob(".hermes-case-probe-*")) == []
+
+
+def test_unicode_normalized_paths_collide_on_exact_identity() -> None:
+    from hermes_cli.update_authority import _paths_collide
+
+    assert _paths_collide("Café.txt", "Cafe\N{COMBINING ACUTE ACCENT}.txt", case_sensitive=True)
+    assert _paths_collide("Café/child.txt", "Cafe\N{COMBINING ACUTE ACCENT}", case_sensitive=True)
+    assert _paths_collide("Cafe\N{COMBINING ACUTE ACCENT}", "Café/child.txt", case_sensitive=True)
 
 
 def test_fast_forward_preserves_noncolliding_tracked_deletion(tmp_path: Path) -> None:

@@ -64,7 +64,7 @@ function refusalCases() {
   ] as const
 }
 
-function windowsDeps(overrides: { config?: any; probe?: any } = {}) {
+function windowsDeps(overrides: { config?: any; probe?: any; updater?: string | null; bootstrapMode?: any } = {}) {
   const effects = {
     backup: vi.fn(),
     marker: vi.fn(),
@@ -77,16 +77,21 @@ function windowsDeps(overrides: { config?: any; probe?: any } = {}) {
     IS_PACKAGED: true,
     IS_MAC: false,
     updateInFlight: false,
-    resolveUpdaterBinary: () => '/updater.exe',
+    resolveUpdaterBinary: vi.fn(() => (overrides.updater === undefined ? '/updater.exe' : overrides.updater)),
+    classifyWindowsBootstrapMode: vi.fn(async () =>
+      overrides.bootstrapMode ?? { ok: true, mode: 'managed-checkout-recovery', evidence: 'active root exists' }
+    ),
     applyUpdatesPosixHandoff: vi.fn(),
     resolveUpdateRoot: () => '/repo',
     resolveUpdateScriptHandoff: () => ({ command: 'powershell', args: [], scriptPath: '/repo/windows.ps1' }),
-    configuredUpdateAuthority: () => overrides.config ?? { ok: true, authority },
-    runDesktopAuthorityProbe: async () =>
-      overrides.probe ?? { ok: true, topology: 'behind', head: 'a'.repeat(40), remoteTip: 'b'.repeat(40) },
+    configuredUpdateAuthority: vi.fn(() => overrides.config ?? { ok: true, authority }),
+    runDesktopAuthorityProbe: vi.fn(async () =>
+      overrides.probe ?? { ok: true, topology: 'behind', head: 'a'.repeat(40), remoteTip: 'b'.repeat(40) }
+    ),
     crypto: { randomUUID: () => 'nonce-windows' },
     process: { pid: 77, env: {}, execPath: '/Hermes.exe' },
     HERMES_HOME: '/home',
+    ACTIVE_HERMES_ROOT: '/active-root',
     path,
     directoryExists: () => true,
     fileExists: () => true,
@@ -121,6 +126,47 @@ function windowsDeps(overrides: { config?: any; probe?: any } = {}) {
 }
 
 describe('Windows updater callers are authority-first', () => {
+  test.each([
+    ['missing active root', Object.assign(new Error('missing'), { code: 'ENOENT' }), { ok: true, mode: 'fresh-install' }],
+    ['existing active root', null, { ok: true, mode: 'managed-checkout-recovery' }],
+    [
+      'unreadable active root',
+      Object.assign(new Error('denied'), { code: 'EACCES' }),
+      { ok: false, code: 'BOOTSTRAP_INSTALL_STATE_UNVERIFIED' }
+    ]
+  ])('classifies Windows bootstrap state from the active root: %s', async (_label, failure, expected) => {
+    const lstatSync = vi.fn(() => {
+      if (failure) {
+        throw failure
+      }
+      return { isDirectory: () => true }
+    })
+    const classify = compileFunction('classifyWindowsBootstrapMode', {
+      fs: {
+        lstatSync
+      }
+    })
+
+    await expect(classify('/authority-checkout')).resolves.toMatchObject(expected)
+    expect(lstatSync).toHaveBeenCalledWith('/authority-checkout')
+  })
+
+  test('an existing canonical active root prevents a missing override from being classified fresh', async () => {
+    const lstatSync = vi.fn((candidate: string) => {
+      if (candidate === '/missing-override') {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      }
+      return { isDirectory: () => true }
+    })
+    const classify = compileFunction('classifyWindowsBootstrapMode', { fs: { lstatSync } })
+
+    await expect(classify('/missing-override', '/canonical-active')).resolves.toMatchObject({
+      ok: true,
+      mode: 'managed-checkout-recovery'
+    })
+    expect(lstatSync.mock.calls).toEqual([['/missing-override'], ['/canonical-active']])
+  })
+
   for (const [label, overrides] of refusalCases()) {
     test(`normal apply refuses ${label} before destructive handoff effects`, async () => {
       const { deps, effects } = windowsDeps(overrides)
@@ -153,6 +199,146 @@ describe('Windows updater callers are authority-first', () => {
     expect(mainSource.includes('resolveHealedBranch')).toBe(false)
     expect(extractFunction('applyUpdates').includes("'hermes update'")).toBe(false)
     expect(extractFunction('handOffWindowsBootstrapRecovery').includes('DEFAULT_UPDATE_BRANCH')).toBe(false)
+  })
+
+  for (const [label, authorityOverrides] of refusalCases()) {
+    test(`managed recovery without a staged updater refuses ${label} without generic bootstrap`, async () => {
+      const { deps, effects } = windowsDeps({ ...authorityOverrides, updater: null })
+      const runBootstrap = vi.fn()
+      const handoff = compileFunction('handOffWindowsBootstrapRecovery', {
+        ...deps,
+        chooseUpdaterArgs: () => ['--update'],
+        localBackendLifecycle: { assertCanStart: vi.fn() }
+      })
+
+      const result = await handoff('bootstrap-needed')
+      if (!result) {
+        await runBootstrap()
+      }
+
+      expect(result).toMatchObject({ ok: false })
+      expect(deps.resolveUpdaterBinary).not.toHaveBeenCalled()
+      expect(runBootstrap).not.toHaveBeenCalled()
+      expect(effects.backup).not.toHaveBeenCalled()
+      expect(effects.marker).not.toHaveBeenCalled()
+      expect(effects.release).not.toHaveBeenCalled()
+      expect(effects.spawn).not.toHaveBeenCalled()
+      expect(effects.quit).not.toHaveBeenCalled()
+    })
+  }
+
+  test('managed recovery with valid authority but no staged updater refuses before generic bootstrap', async () => {
+    const { deps, effects } = windowsDeps({ updater: null })
+    const runBootstrap = vi.fn()
+    const handoff = compileFunction('handOffWindowsBootstrapRecovery', {
+      ...deps,
+      chooseUpdaterArgs: () => ['--update'],
+      localBackendLifecycle: { assertCanStart: vi.fn() }
+    })
+
+    const result = await handoff('bootstrap-needed')
+    if (!result) {
+      await runBootstrap()
+    }
+
+    expect(result).toMatchObject({ ok: false, code: 'WINDOWS_UPDATER_MISSING' })
+    expect(deps.classifyWindowsBootstrapMode).toHaveBeenCalledOnce()
+    expect(deps.classifyWindowsBootstrapMode).toHaveBeenCalledWith('/repo', '/active-root')
+    expect(deps.configuredUpdateAuthority).toHaveBeenCalledOnce()
+    expect(deps.runDesktopAuthorityProbe).toHaveBeenCalledOnce()
+    expect(deps.resolveUpdaterBinary).toHaveBeenCalledOnce()
+    expect(deps.runDesktopAuthorityProbe.mock.invocationCallOrder[0]).toBeLessThan(
+      deps.resolveUpdaterBinary.mock.invocationCallOrder[0]
+    )
+    expect(runBootstrap).not.toHaveBeenCalled()
+    expect(effects.backup).not.toHaveBeenCalled()
+    expect(effects.marker).not.toHaveBeenCalled()
+    expect(effects.release).not.toHaveBeenCalled()
+    expect(effects.spawn).not.toHaveBeenCalled()
+    expect(effects.quit).not.toHaveBeenCalled()
+  })
+
+  test('managed recovery with valid equal authority still refuses generic bootstrap', async () => {
+    const { deps, effects } = windowsDeps({
+      probe: { ok: true, topology: 'equal', head: 'a'.repeat(40), remoteTip: 'a'.repeat(40) }
+    })
+    const runBootstrap = vi.fn()
+    const handoff = compileFunction('handOffWindowsBootstrapRecovery', {
+      ...deps,
+      chooseUpdaterArgs: () => ['--update'],
+      localBackendLifecycle: { assertCanStart: vi.fn() }
+    })
+
+    const result = await handoff('bootstrap-needed')
+    if (!result) {
+      await runBootstrap()
+    }
+
+    expect(result).toMatchObject({ ok: false, code: 'WINDOWS_MANAGED_RECOVERY_UNSUPPORTED' })
+    expect(runBootstrap).not.toHaveBeenCalled()
+    expect(effects.backup).not.toHaveBeenCalled()
+    expect(effects.marker).not.toHaveBeenCalled()
+    expect(effects.release).not.toHaveBeenCalled()
+    expect(effects.spawn).not.toHaveBeenCalled()
+    expect(effects.quit).not.toHaveBeenCalled()
+  })
+
+  test('uncertain Windows install state refuses before updater resolution or generic bootstrap', async () => {
+    const { deps, effects } = windowsDeps({
+      updater: null,
+      bootstrapMode: { ok: false, code: 'BOOTSTRAP_INSTALL_STATE_UNVERIFIED', message: 'unreadable root' }
+    })
+    const runBootstrap = vi.fn()
+    const handoff = compileFunction('handOffWindowsBootstrapRecovery', {
+      ...deps,
+      chooseUpdaterArgs: () => ['--update'],
+      localBackendLifecycle: { assertCanStart: vi.fn() }
+    })
+
+    const result = await handoff('bootstrap-needed')
+    if (!result) {
+      await runBootstrap()
+    }
+
+    expect(result).toMatchObject({ ok: false, code: 'BOOTSTRAP_INSTALL_STATE_UNVERIFIED' })
+    expect(deps.resolveUpdaterBinary).not.toHaveBeenCalled()
+    expect(deps.configuredUpdateAuthority).not.toHaveBeenCalled()
+    expect(deps.runDesktopAuthorityProbe).not.toHaveBeenCalled()
+    expect(runBootstrap).not.toHaveBeenCalled()
+    expect(effects.backup).not.toHaveBeenCalled()
+    expect(effects.marker).not.toHaveBeenCalled()
+    expect(effects.release).not.toHaveBeenCalled()
+    expect(effects.spawn).not.toHaveBeenCalled()
+    expect(effects.quit).not.toHaveBeenCalled()
+  })
+
+  test('a verified fresh install may enter generic bootstrap without resolving the staged updater', async () => {
+    const { deps, effects } = windowsDeps({
+      updater: null,
+      bootstrapMode: { ok: true, mode: 'fresh-install', evidence: 'active root absent' }
+    })
+    const runBootstrap = vi.fn()
+    const handoff = compileFunction('handOffWindowsBootstrapRecovery', {
+      ...deps,
+      chooseUpdaterArgs: () => ['--update'],
+      localBackendLifecycle: { assertCanStart: vi.fn() }
+    })
+
+    const result = await handoff('bootstrap-needed')
+    if (!result) {
+      await runBootstrap()
+    }
+
+    expect(result).toBe(false)
+    expect(runBootstrap).toHaveBeenCalledOnce()
+    expect(deps.resolveUpdaterBinary).not.toHaveBeenCalled()
+    expect(deps.configuredUpdateAuthority).not.toHaveBeenCalled()
+    expect(deps.runDesktopAuthorityProbe).not.toHaveBeenCalled()
+    expect(effects.backup).not.toHaveBeenCalled()
+    expect(effects.marker).not.toHaveBeenCalled()
+    expect(effects.release).not.toHaveBeenCalled()
+    expect(effects.spawn).not.toHaveBeenCalled()
+    expect(effects.quit).not.toHaveBeenCalled()
   })
 })
 
