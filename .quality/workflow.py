@@ -21,9 +21,6 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [@@BRANCH@@]
-  schedule:
-    - cron: '@@MINUTE@@ 2 * * *'
-      timezone: America/Denver
   workflow_dispatch:
     inputs:
       mode:
@@ -39,7 +36,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: quality-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'change' }}
+  group: quality-${{ github.event.pull_request.number || github.ref }}-change
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   select:
@@ -74,7 +71,7 @@ jobs:
           name: quality-selection
           path: .quality-results/*.json
           include-hidden-files: true
-          retention-days: 30
+          retention-days: 1
           if-no-files-found: error
 
   checks:
@@ -142,7 +139,7 @@ jobs:
             .quality-checks/*.json
             .quality-checks/*.log
           include-hidden-files: true
-          retention-days: 30
+          retention-days: 2
           if-no-files-found: error
 @@DIAGNOSTICS@@
 
@@ -185,7 +182,7 @@ jobs:
           name: quality-evidence
           path: .quality-results/**/*.json
           include-hidden-files: true
-          retention-days: 30
+          retention-days: ${{ job.status == 'success' && 2 || 7 }}
           if-no-files-found: error
 '''
 
@@ -194,15 +191,12 @@ def render(manifest):
     result = TEMPLATE
     for name, sha in PINS.items():
         result = result.replace('@@@' + name + '@@', '@' + sha)
-    minute = int(manifest.get('ci', {}).get('nightly_minute', 17))
-    if not 0 <= minute <= 59:
-        raise ValueError('nightly_minute must be 0..59')
     extras = manifest.get('ci', {}).get('compilation_caches', [])
     allowed = {'.next/cache', 'apps/web/.next/cache', '.turbo', 'target', 'src-tauri/target', '.mypy_cache', '.quality-cache/cargo/registry', '.quality-cache/cargo/git'}
     if not set(extras) <= allowed:
         raise ValueError('Compilation cache paths must be explicitly safe; databases and secrets are never cached')
     replacements = {'BRANCH': json.dumps(manifest.get('default_branch', 'main')),
-                    'MINUTE': str(minute), 'PYTHON': manifest['runtimes']['python'],
+                    'PYTHON': manifest['runtimes']['python'],
                     'CACHE_PATHS': '\n'.join('            ' + path for path in extras)}
     for key, value in replacements.items():
         result = result.replace('@@' + key + '@@', value)
@@ -258,7 +252,7 @@ def render(manifest):
           name: diagnostics-${{ matrix.runner }}
           path: |
 PATHS
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore
 '''.replace('PIN', PINS['upload-artifact']).replace('PATHS', '\n'.join('            '+p for p in diagnostics))
     if ci.get('api_image_artifact'):
@@ -328,7 +322,7 @@ PACKAGE_MANAGER
       - name: Install smoke dependencies without production credentials
         run: python3 .quality/quality.py bootstrap --runner ubuntu-24.04
 BROWSER_SETUP
-      - name: Verify coverage, stage production, smoke, promote and observe
+      - name: Verify coverage, stage production, smoke and promote
         env:
           GH_TOKEN: ${{ github.token }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -342,7 +336,7 @@ BROWSER_SETUP
           name: release-evidence
           path: .quality-release/*.json
           include-hidden-files: true
-          retention-days: 90
+          retention-days: 7
           if-no-files-found: warn
 '''
     replacements = {'BRANCH':json.dumps(manifest.get('default_branch','main')), 'CHECKOUT':PINS['checkout'],

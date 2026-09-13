@@ -179,6 +179,10 @@ def deployment_records(manifest):
 
 
 def previous_is_verified(records, deployment_id):
+    verified_descriptions = {
+        'quality: healthy after promotion smoke',
+        'quality: healthy after ten-minute observation',
+    }
     for record in records:
         payload = record.get('payload') or {}
         if isinstance(payload, str):
@@ -188,7 +192,7 @@ def previous_is_verified(records, deployment_id):
                 continue
         if payload.get('artifact_id') != deployment_id:
             continue
-        return any(s.get('state') == 'success' and s.get('description') == 'quality: healthy after ten-minute observation'
+        return any(s.get('state') == 'success' and s.get('description') in verified_descriptions
                    for s in record.get('quality_statuses', []))
     return False
 
@@ -389,32 +393,29 @@ def run(manifest, candidate, deployment_id, state_path):
     # Promotion can restore Vercel auto-assignment. Keep the next release staged.
     vercel('/v9/projects/'+project_id, token, team, 'PATCH', {'autoAssignCustomDomains':False})
     wait_current(project_id, deployment_id, token, team)
-    state.update(promoted=True, promoted_at=stamp(), status='observing')
+    state.update(promoted=True, promoted_at=stamp(), status='verifying')
     ci.write(state_path, state)
-    deadline = time.monotonic()+600
-    while time.monotonic() < deadline:
-        if confirmed_failure(lambda: smoke(manifest, release['production_url'])):
-            current = vercel('/v9/projects/'+project_id, token, team).get('targets',{}).get('production',{}).get('id')
-            state['status'] = 'failed'
-            if rollback_allowed(state, current, compatible):
-                # Persist before mutation so interrupted/retried runs cannot roll back twice.
-                state['rollback_attempted'] = True
-                state['recovery_started_at'] = stamp()
-                ci.write(state_path, state)
-                release_status(manifest, record['id'], 'failure', 'quality: rollback attempted')
-                vercel(f'/v1/projects/{project_id}/rollback/{state["previous_id"]}', token, team, method='POST', body={})
-                wait_current(project_id, state['previous_id'], token, team)
-                state['status'] = 'recovered' if smoke(manifest, release['production_url']) else 'recovery_failed'
-                state['recovery_completed_at'] = stamp()
-            else:
-                state['recovery_blocked'] = 'Previous verified artifact, state compatibility, and current candidate identity are required'
+    if confirmed_failure(lambda: smoke(manifest, release['production_url'])):
+        current = vercel('/v9/projects/'+project_id, token, team).get('targets',{}).get('production',{}).get('id')
+        state['status'] = 'failed'
+        if rollback_allowed(state, current, compatible):
+            # Persist before mutation so interrupted/retried runs cannot roll back twice.
+            state['rollback_attempted'] = True
+            state['recovery_started_at'] = stamp()
             ci.write(state_path, state)
-            release_status(manifest, record['id'], 'failure', 'quality: '+state['status'])
-            raise ReleaseError('Confirmed production failure: '+state['status'])
-        time.sleep(min(20, max(0, deadline-time.monotonic())))
+            release_status(manifest, record['id'], 'failure', 'quality: rollback attempted')
+            vercel(f'/v1/projects/{project_id}/rollback/{state["previous_id"]}', token, team, method='POST', body={})
+            wait_current(project_id, state['previous_id'], token, team)
+            state['status'] = 'recovered' if smoke(manifest, release['production_url']) else 'recovery_failed'
+            state['recovery_completed_at'] = stamp()
+        else:
+            state['recovery_blocked'] = 'Previous verified artifact, state compatibility, and current candidate identity are required'
+        ci.write(state_path, state)
+        release_status(manifest, record['id'], 'failure', 'quality: '+state['status'])
+        raise ReleaseError('Confirmed production failure: '+state['status'])
     state.update(status='healthy', completed_at=stamp())
     ci.write(state_path, state)
-    release_status(manifest, record['id'], 'success', 'quality: healthy after ten-minute observation')
+    release_status(manifest, record['id'], 'success', 'quality: healthy after promotion smoke')
     return state
 
 

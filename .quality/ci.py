@@ -102,6 +102,59 @@ def history(repository, branch, directory):
     return result
 
 
+def adoptable_runs(runs, repository, tree):
+    """Same-repository, first-attempt, successful pull-request runs that verified this exact tree."""
+    return [run for run in runs
+            if run.get('event') == 'pull_request' and run.get('path', '').split('@')[0] == WORKFLOW
+            and run.get('status') == 'completed' and run.get('conclusion') == 'success' and run.get('run_attempt') == 1
+            and run.get('repository', {}).get('full_name') == repository
+            and run.get('head_repository', {}).get('full_name') == repository
+            and (run.get('head_commit') or {}).get('tree_id') == tree]
+
+
+def adopt_pull_request(manifest, head, tree, outdir, workdir='.quality-adopt'):
+    """Adopt a pull-request run's evidence for a pushed commit with the identical tree.
+
+    The engine verifies the evidence; any refusal or transport failure falls back to
+    running the selected checks, so adoption can only remove repeated work.
+    """
+    repository = manifest['repository']
+    try:
+        runs = api(f'repos/{repository}/actions/workflows/quality.yml/runs?event=pull_request&status=success&per_page=50')['workflow_runs']
+    except (RuntimeError, KeyError, TypeError):
+        return None
+    for run in adoptable_runs(runs, repository, tree):
+        directory = Path(workdir)/str(run['id'])
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            evidence = []
+            for artifact in api(f'repos/{repository}/actions/runs/{run["id"]}/artifacts')['artifacts']:
+                if artifact['name'] != 'quality-evidence' or artifact.get('expired'):
+                    continue
+                if artifact.get('size_in_bytes', MAX_ARTIFACT + 1) > MAX_ARTIFACT:
+                    continue
+                evidence.extend(extract_evidence(api(f'repos/{repository}/actions/artifacts/{artifact["id"]}/zip', binary=True), directory))
+            records = [item for item in evidence if str(item['value'].get('provenance', {}).get('run_id')) == str(run['id'])]
+            merges = {item['value']['provenance'].get('sha') for item in records}
+            if not records or len(merges) != 1 or None in merges:
+                continue
+            merge_sha = merges.pop()
+            source = {'repository': run['repository']['full_name'], 'head_repository': run['head_repository']['full_name'],
+                      'run_id': run['id'], 'run_attempt': run['run_attempt'], 'event': run['event'],
+                      'path': run['path'].split('@')[0], 'conclusion': run['conclusion'], 'head_sha': run['head_sha'],
+                      'head_tree': run['head_commit']['tree_id'], 'merge_sha': merge_sha,
+                      'merge_tree': api(f'repos/{repository}/git/commits/{merge_sha}')['tree']['sha']}
+            write(directory/'source.json', source)
+            args = ['adopt', '--selection', Path(outdir)/'selection.json', '--source', directory/'source.json', '--output-dir', outdir]
+            for item in records:
+                args.extend(['--evidence', item['path']])
+            engine(*args)
+            return {'run_id': run['id'], 'head_sha': run['head_sha']}
+        except (RuntimeError, ValueError, KeyError, TypeError, zipfile.BadZipFile, subprocess.CalledProcessError):
+            continue
+    return None
+
+
 def ancestor(base, head):
     return subprocess.run(['git', 'merge-base', '--is-ancestor', base, head],
                           capture_output=True).returncode == 0
@@ -180,10 +233,21 @@ def select(event_path, outdir):
     engine(*args)
     plan = json.loads((outdir/'selection.json').read_text(encoding='utf-8'))
     runners = sorted({check['runner'] for check in plan['checks']})
+    adopted = None
+    if event_name == 'push' and runners:
+        # A squash merge of an up-to-date branch repeats a tree its pull request already verified.
+        try:
+            tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+            adopted = adopt_pull_request(manifest, head, tree, outdir)
+        except (RuntimeError, KeyError, subprocess.CalledProcessError):
+            adopted = None
+    if adopted:
+        runners = []
+        reason = f"identical tree verified by pull-request run {adopted['run_id']}"
     matrix = {'include': [{'runner': runner, 'bootstrap': any(c['runner'] == runner and c['kind'] != 'docs' for c in plan['checks'])} for runner in runners] or [{'runner': 'ubuntu-24.04', 'bootstrap': False}]}
     outputs = {'base': base, 'head': head, 'mode': 'full' if plan['full'] else 'affected',
                'has_checks': str(bool(runners)).lower(), 'matrix': json.dumps(matrix), 'reason': reason,
-               'runtimes': json.dumps(manifest.get('runtimes', {}))}
+               'runtimes': json.dumps(manifest.get('runtimes', {})), 'adopted': str(bool(adopted)).lower()}
     if os.environ.get('GITHUB_OUTPUT'):
         with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
             for key, value in outputs.items():
@@ -198,7 +262,7 @@ def aggregate(directory, needs):
     directory = Path(directory)
     args = ['aggregate', '--selection', directory/'selection.json', '--needs-json', needs,
             '--output', directory/'summary.json']
-    for path in sorted(directory.glob('checks/**/*.json')):
+    for path in [*sorted(directory.glob('checks/**/*.json')), *sorted(directory.glob('adopted-evidence-*.json'))]:
         value = json.loads(path.read_text(encoding='utf-8'))
         if isinstance(value, dict) and {'head', 'checks', 'provenance'} <= value.keys():
             args.extend(['--evidence', path])
