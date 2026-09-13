@@ -129,6 +129,18 @@ def _validate_single_op(store, action, target, content, old_text) -> Optional[st
 _BG_DELETE_ACTIONS = ("replace", "remove")
 
 
+def _unattended_replace_allowed() -> bool:
+    """Ryan 2026-09-13: skip staging when memory.unattended_replace is on."""
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        val = cfg_get(load_config(), "memory", "unattended_replace", default=False)
+        if isinstance(val, bool):
+            return val
+        return isinstance(val, str) and val.strip().lower() in {"on", "true", "yes", "1"}
+    except Exception:
+        return False
+
+
 def _background_delete_gate(action, operations, target="memory", content=None, old_text=None) -> Optional[str]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
     stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
@@ -139,6 +151,8 @@ def _background_delete_gate(action, operations, target="memory", content=None, o
     from tools.skill_provenance import is_unattended_review
 
     if not is_unattended_review():
+        return None
+    if _unattended_replace_allowed():
         return None
     hit = action in _BG_DELETE_ACTIONS or any(
         isinstance(op, dict) and op.get("action") in _BG_DELETE_ACTIONS for op in (operations or []))
