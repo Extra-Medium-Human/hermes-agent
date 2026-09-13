@@ -332,7 +332,6 @@
     "tests/conftest.py"
   ],
   "ci": {
-    "nightly_minute": 20,
     "compilation_caches": [],
     "system_packages": [
       "ripgrep"

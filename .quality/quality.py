@@ -478,13 +478,15 @@ def aggregate(selection, records, needs=None):
     if selection.get("selection_hash") != digest({k: v for k, v in selection.items() if k != "selection_hash"}):
         errors.append("Selection integrity mismatch")
     expected = {item["id"]: item for item in selection["checks"]}
+    # Evidence adopted from a pull-request run on the identical tree replaces the checks job.
+    adopted = bool(records) and all(isinstance(record, dict) and record.get("adopted_from") for record in records)
     if needs is not None:
         if not isinstance(needs, dict) or not needs:
             errors.append("Missing CI job results")
         else:
             for name, job in needs.items():
                 selector = needs.get("select", needs.get("selector", {}))
-                allowed_empty = not expected and name == "checks" and isinstance(job, dict) and job.get("result") == "skipped" and selector.get("result") == PASS
+                allowed_empty = (not expected or adopted) and name == "checks" and isinstance(job, dict) and job.get("result") == "skipped" and selector.get("result") == PASS
                 if not allowed_empty and (not isinstance(job, dict) or job.get("result") != PASS):
                     errors.append(f"CI job {name}: {job.get('result', 'missing') if isinstance(job, dict) else 'missing'}")
     for record in records:
@@ -571,7 +573,9 @@ def release_verify(root, manifest, candidate, baseline_records, affected_records
             trusted(record, raw_hash, trusted_runs, manifest)
             if record.get("mode") != "full" or record.get("status") != PASS:
                 raise QualityError("Baseline is not a successful full regression")
-            age = current_time - timestamp(record["completed_at"])
+            # Adopted evidence ages from when its checks ran, not from when it was adopted.
+            ran = record.get("adopted_from", {}).get("completed_at") or record["completed_at"]
+            age = current_time - timestamp(ran)
             if age < dt.timedelta(0) or (max_age_hours is not None and age >= dt.timedelta(hours=max_age_hours)):
                 raise QualityError("Full baseline is missing, future-dated, or at least 24 hours old")
             actual_plan = select(root, baseline_manifest, record["base"], base, full=True)
@@ -618,6 +622,80 @@ def release_verify(root, manifest, candidate, baseline_records, affected_records
     except (QualityError, KeyError, ValueError, TypeError) as error:
         fallback["reasons"].append(str(error))
         return fallback
+
+
+def adopt(root, manifest, selection, records, source, at=None, max_age_hours=24):
+    """Record a default-branch push's evidence from a pull-request run on the identical tree.
+
+    Squash-merging a branch that is up to date with the default branch produces exactly
+    the tree that branch's Quality run verified, and input fingerprints are content
+    hashes, so that run's first-attempt results are this commit's results. The push run
+    (trusted default-branch code) checks everything the release would otherwise trust
+    only from its own execution; anything short of an exact match runs the checks.
+    """
+    current_time = at or dt.datetime.now(UTC)
+    head = revision(root, selection["head"])
+    if selection.get("selection_hash") != digest({k: v for k, v in selection.items() if k != "selection_hash"}):
+        raise QualityError("Selection integrity mismatch")
+    if select(root, manifest, selection["base"], head, selection["full"]) != selection:
+        raise QualityError("Selection does not match the current adapter and committed inputs")
+    if not selection["checks"]:
+        raise QualityError("Nothing selected to adopt")
+    tree_id = git(root, "rev-parse", "--verify", "--end-of-options", head + "^{tree}").decode().strip()
+    workflows = manifest.get("trusted_workflows", [".github/workflows/quality.yml"])
+    if (source.get("event") != "pull_request" or source.get("conclusion") != PASS or str(source.get("run_attempt")) != "1"
+            or source.get("path") not in workflows or source.get("repository") != manifest["repository"]
+            or source.get("head_repository") != manifest["repository"]):
+        raise QualityError("Only a successful first-attempt pull-request run of this repository's workflow can be adopted")
+    if source.get("head_tree") != tree_id or source.get("merge_tree") != tree_id:
+        raise QualityError("Pull-request tree differs from the pushed commit")
+    if source.get("head_sha") == head:
+        raise QualityError("Adoption binds a pull-request commit, not the pushed commit itself")
+    results, digests, ran = {}, [], []
+    for record, raw_hash in records:
+        p = record.get("provenance", {})
+        if (p.get("provider") != "github-actions" or p.get("repository") != manifest["repository"]
+                or str(p.get("run_id")) != str(source.get("run_id")) or str(p.get("run_attempt")) != "1"
+                or p.get("event") != "pull_request" or p.get("workflow") != source.get("path") or p.get("sha") != source.get("merge_sha")):
+            raise QualityError("Evidence does not come from the adopted pull-request run")
+        if record.get("head") != source.get("head_sha") or record.get("repository") != manifest["repository"] or record.get("status") != PASS:
+            raise QualityError("Evidence is not a successful record of the pull-request commit")
+        completed = timestamp(record["completed_at"])
+        age = current_time - completed
+        if age < dt.timedelta(0) or age >= dt.timedelta(hours=max_age_hours):
+            raise QualityError("Pull-request evidence is future-dated or at least 24 hours old")
+        for item in record.get("checks", []):
+            key = (item.get("id"), record.get("runner"))
+            if key in results:
+                raise QualityError(f"Duplicate pull-request result: {item.get('id')}")
+            if item.get("status") != PASS or item.get("attempt") != 1 or item.get("exit_code") != 0:
+                raise QualityError(f"Check {item.get('id')}: failed or retried on the pull request")
+            results[key] = item
+        digests.append(raw_hash)
+        ran.append(completed)
+    if not results:
+        raise QualityError("No pull-request evidence to adopt")
+    adopted = []
+    for runner in sorted({item["runner"] for item in selection["checks"]}):
+        checks = []
+        for wanted in (item for item in selection["checks"] if item["runner"] == runner):
+            item = results.get((wanted["id"], runner))
+            if not item or item.get("input_hash") != wanted["input_hash"] or item.get("command_hash") != wanted["command_hash"]:
+                raise QualityError(f"Pull-request evidence does not cover {wanted['id']} with identical inputs")
+            checks.append({"id": wanted["id"], "input_hash": wanted["input_hash"], "command_hash": wanted["command_hash"],
+                           "attempt": 1, "status": PASS, "exit_code": 0, "duration_seconds": item.get("duration_seconds"),
+                           "started_at": item.get("started_at"), "completed_at": item.get("completed_at")})
+        record = {k: selection[k] for k in ("schema_version", "engine_version", "repository", "base", "head", "selection_hash", "policy_hash", "relevant_hash")}
+        record.update({"mode": "full" if selection["full"] else "affected", "started_at": now(), "runner": runner, "checks": checks,
+                       "provenance": provenance(manifest), "status": PASS,
+                       "adopted_from": {"run_id": source["run_id"], "run_attempt": 1, "head_sha": source["head_sha"],
+                                        "merge_sha": source["merge_sha"], "tree": tree_id, "evidence_sha256": sorted(digests),
+                                        "completed_at": min(ran).isoformat()},
+                       "metrics": {"duration_seconds": 0, "first_attempt_failures": 0, "checks_executed": 0, "retry_count": 0,
+                                   "checks_adopted": len(checks)}})
+        record["completed_at"] = now()
+        adopted.append(record)
+    return adopted
 
 
 def nightly(root, manifest, head, previous, trusted_runs, at=None, slot=0):
@@ -697,6 +775,11 @@ def main(argv=None):
     aggregate_parser.add_argument("--evidence", action="append", default=[])
     aggregate_parser.add_argument("--needs-json")
     aggregate_parser.add_argument("--output")
+    adoption = sub.add_parser("adopt")
+    adoption.add_argument("--selection", required=True)
+    adoption.add_argument("--source", required=True)
+    adoption.add_argument("--evidence", action="append", default=[])
+    adoption.add_argument("--output-dir", required=True)
     release = sub.add_parser("release")
     release_sub = release.add_subparsers(dest="release_command", required=True)
     verify = release_sub.add_parser("verify")
@@ -760,6 +843,15 @@ def main(argv=None):
             records = [record for record, _ in read_records(args.evidence)]
             needs = json.loads(Path(args.needs_json).read_text(encoding="utf-8")) if args.needs_json else None
             result = aggregate(selection, records, needs)
+        elif args.command == "adopt":
+            selection = json.loads(Path(args.selection).read_text(encoding="utf-8"))
+            source = json.loads(Path(args.source).read_text(encoding="utf-8"))
+            written = []
+            for record in adopt(root, manifest, selection, read_records(args.evidence), source):
+                path = Path(args.output_dir) / f"adopted-evidence-{record['runner']}.json"
+                output(record, path)
+                written.append(str(path))
+            result = {"status": PASS, "adopted": written, "run_id": source["run_id"]}
         elif args.command == "release":
             runs = json.loads(Path(args.trusted_runs).read_text(encoding="utf-8"))
             result = release_verify(root, manifest, args.candidate, read_records(args.baseline), read_records(args.evidence), runs)
