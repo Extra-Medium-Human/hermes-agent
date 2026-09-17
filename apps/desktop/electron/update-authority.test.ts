@@ -63,6 +63,17 @@ test('network and auth uncertainty remain typed refusals', () => {
     code: 'AUTHORITY_UNVERIFIED',
     message: 'Update authority preflight failed or returned malformed output.'
   })
+
+  expect(parseAuthorityPreflightResult(
+    0,
+    JSON.stringify({ ok: true, topology: 'ahead', head: 'a'.repeat(40), remote_tip: 'b'.repeat(40) }),
+    ''
+  )).toEqual({
+    ok: true,
+    topology: 'equal',
+    head: 'a'.repeat(40),
+    remoteTip: 'b'.repeat(40)
+  })
 })
 
 test('explicit main is legal only as a fully tracked authority tuple', () => {

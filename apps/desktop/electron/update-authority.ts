@@ -106,9 +106,10 @@ export function parseAuthorityPreflightResult(
 ): AuthorityPreflightResult {
   try {
     const parsed = JSON.parse(stdout)
-    if (exitCode === 0 && parsed?.ok === true && ['equal', 'behind'].includes(parsed.topology)) {
+    const topology = parsed?.topology === 'ahead' ? 'equal' : parsed?.topology
+    if (exitCode === 0 && parsed?.ok === true && ['equal', 'behind'].includes(topology)) {
       if (typeof parsed.head === 'string' && typeof parsed.remote_tip === 'string') {
-        return { ok: true, topology: parsed.topology, head: parsed.head, remoteTip: parsed.remote_tip }
+        return { ok: true, topology, head: parsed.head, remoteTip: parsed.remote_tip }
       }
     }
     if (

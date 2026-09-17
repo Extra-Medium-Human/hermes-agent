@@ -147,8 +147,13 @@ def test_remote_ahead_is_classified_as_fast_forwardable(tmp_path: Path) -> None:
     assert git(checkout, "rev-parse", "HEAD") == local_head
 
 
-def test_local_ahead_carried_commits_refuse_without_moving_head(tmp_path: Path) -> None:
-    from hermes_cli.update_authority import AuthorityRefusal, UpdateAuthority, probe_authority
+def test_local_ahead_carried_commits_check_without_moving_head(tmp_path: Path) -> None:
+    from hermes_cli.update_authority import (
+        AuthorityRefusal,
+        UpdateAuthority,
+        apply_fast_forward,
+        probe_authority,
+    )
 
     checkout, remote, branch = authority_repo(tmp_path)
     (checkout / "local.txt").write_text("carried\n", encoding="utf-8")
@@ -163,12 +168,58 @@ def test_local_ahead_carried_commits_refuse_without_moving_head(tmp_path: Path) 
         tracking_ref=f"refs/remotes/fork/{branch}",
     )
 
-    with pytest.raises(AuthorityRefusal) as raised:
-        probe_authority(authority, nonce="nonce-ahead")
+    probe = probe_authority(authority, nonce="nonce-ahead")
 
-    assert raised.value.code == "AUTHORITY_AHEAD"
+    assert probe.topology == "ahead"
+    assert probe.head == local_head
+    assert git(checkout, "rev-parse", "HEAD") == local_head
+    with pytest.raises(AuthorityRefusal) as raised:
+        apply_fast_forward(probe)
+    assert raised.value.code == "AUTHORITY_NOT_ADVANCEABLE"
     assert git(checkout, "rev-parse", "HEAD") == local_head
     assert git(checkout, "cat-file", "-t", local_head) == "commit"
+
+
+def test_check_json_maps_ahead_to_equal_for_desktop_parser(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from hermes_cli.update_authority import UpdateAuthority, main, probe_authority
+
+    checkout, remote, branch = authority_repo(tmp_path)
+    (checkout / "local.txt").write_text("carried\n", encoding="utf-8")
+    git(checkout, "add", "local.txt")
+    git(checkout, "commit", "-m", "carried local commit")
+    authority = UpdateAuthority(
+        repo=checkout,
+        remote="fork",
+        remote_url=str(remote),
+        branch=branch,
+        tracking_ref=f"refs/remotes/fork/{branch}",
+    )
+    assert probe_authority(authority, nonce="nonce-ahead-json").topology == "ahead"
+    exit_code = main(
+        [
+            "check",
+            "--repo",
+            str(checkout),
+            "--remote",
+            "fork",
+            "--remote-url",
+            str(remote),
+            "--branch",
+            branch,
+            "--tracking-ref",
+            f"refs/remotes/fork/{branch}",
+            "--nonce",
+            "nonce-ahead-json",
+            "--owner",
+            "1",
+        ]
+    )
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+    assert exit_code == 0
+    assert parsed["ok"] is True
+    assert parsed["topology"] == "equal"
+    assert ["equal", "behind"].__contains__(parsed["topology"])
 
 
 def test_diverged_authority_refuses_without_moving_head(tmp_path: Path) -> None:
@@ -637,3 +688,43 @@ def test_cli_authority_tuple_is_all_or_nothing(tmp_path: Path) -> None:
     assert authority is not None
     assert authority.repo == tmp_path
     assert authority.remote == "fork"
+
+
+def test_resolve_git_prefers_explicit_bin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from hermes_cli.update_authority import _resolve_git
+
+    fake = tmp_path / "git"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("HERMES_GIT_BIN", str(fake))
+    git, env = _resolve_git({})
+    assert git == str(fake)
+    assert env == {}
+
+
+def test_resolve_git_falls_back_to_clt_when_stub_git_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from hermes_cli import update_authority as module
+
+    clt_git = tmp_path / "usr" / "bin" / "git"
+    clt_git.parent.mkdir(parents=True)
+    clt_git.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    clt_git.chmod(0o755)
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    monkeypatch.setenv("HERMES_CLT_DEVELOPER_DIR", str(tmp_path))
+    monkeypatch.delenv("HERMES_GIT_BIN", raising=False)
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["git", "--version"]:
+            return subprocess.CompletedProcess(
+                argv, 69, stdout="", stderr="You have not agreed to the Xcode license agreements."
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    git, env = module._resolve_git({"PATH": "/usr/bin"})
+    assert git == str(clt_git)
+    assert env["DEVELOPER_DIR"] == str(tmp_path)
+    assert str(tmp_path / "usr" / "bin") in env["PATH"].split(":")
+

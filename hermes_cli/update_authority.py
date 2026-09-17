@@ -82,11 +82,47 @@ def authority_from_namespace(args) -> UpdateAuthority | None:
     )
 
 
+def _resolve_git(env: dict[str, str]) -> tuple[str, dict[str, str]]:
+    """Prefer a Git that is not Apple's unsigned-Xcode stub.
+
+    Desktop/Electron PATH often hits ``/usr/bin/git``, which exits 69 when the
+    Xcode.app license is unsigned. That made ``git remote get-url`` look like
+    a missing authority remote. Command Line Tools Git still works.
+    """
+    explicit = (os.environ.get("HERMES_GIT_BIN") or "").strip()
+    if explicit:
+        return explicit, env
+    if sys.platform != "darwin":
+        return "git", env
+    probe = subprocess.run(
+        ["git", "--version"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    if probe.returncode == 0:
+        return "git", env
+    clt = (os.environ.get("HERMES_CLT_DEVELOPER_DIR") or "").strip() or "/Library/Developer/CommandLineTools"
+    clt_git = str(Path(clt) / "usr" / "bin" / "git")
+    if not Path(clt_git).is_file():
+        return "git", env
+    env = dict(env)
+    env["DEVELOPER_DIR"] = env.get("DEVELOPER_DIR") or clt
+    clt_bin = str(Path(clt) / "usr" / "bin")
+    path = env.get("PATH") or ""
+    if clt_bin not in path.split(":"):
+        env["PATH"] = f"{clt_bin}:{path}" if path else clt_bin
+    return clt_git, env
+
+
 def _git(authority: UpdateAuthority, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
+    git, env = _resolve_git(env)
     return subprocess.run(
-        ["git", *args],
+        [git, *args],
         cwd=authority.repo,
         capture_output=True,
         text=True,
@@ -356,21 +392,22 @@ def probe_authority(authority: UpdateAuthority, *, nonce: str) -> AuthorityProbe
     head, remote_tip = head_result.stdout.strip(), tip_result.stdout.strip()
     case_sensitive = _probe_filesystem_case_sensitive(authority)
     manifest = _dirty_manifest(authority)
-    collisions = _dirty_collision_paths(
-        manifest,
-        _remote_delta(authority, head, remote_tip),
-        case_sensitive=case_sensitive,
-    )
-    if collisions:
-        raise AuthorityRefusal("DIRTY_COLLISION", f"dirty paths collide with update: {', '.join(collisions)}")
     if head == remote_tip:
         return AuthorityProbe(authority, "equal", head, remote_tip, nonce, manifest)
     local_is_ancestor = _git(authority, "merge-base", "--is-ancestor", head, remote_tip)
-    if local_is_ancestor.returncode == 0:
-        return AuthorityProbe(authority, "behind", head, remote_tip, nonce, manifest)
     remote_is_ancestor = _git(authority, "merge-base", "--is-ancestor", remote_tip, head)
+    if local_is_ancestor.returncode == 0:
+        collisions = _dirty_collision_paths(
+            manifest,
+            _remote_delta(authority, head, remote_tip),
+            case_sensitive=case_sensitive,
+        )
+        if collisions:
+            raise AuthorityRefusal("DIRTY_COLLISION", f"dirty paths collide with update: {', '.join(collisions)}")
+        return AuthorityProbe(authority, "behind", head, remote_tip, nonce, manifest)
     if remote_is_ancestor.returncode == 0:
-        raise AuthorityRefusal("AUTHORITY_AHEAD", "local authority contains unpublished commits")
+        # Carried local commits (live pin). Check is current; apply still refuses FF.
+        return AuthorityProbe(authority, "ahead", head, remote_tip, nonce, manifest)
     if local_is_ancestor.returncode == 1 and remote_is_ancestor.returncode == 1:
         raise AuthorityRefusal("AUTHORITY_DIVERGED", "local and remote authority histories diverged")
     raise AuthorityRefusal("AUTHORITY_UNVERIFIED", "authority topology could not be classified")
@@ -523,6 +560,16 @@ def process_start_identity(pid: int) -> str:
     )
 
 
+def _desktop_reported_topology(topology: str) -> str:
+    """Map probe topology to the packaged Desktop parser contract.
+
+    Live Desktop only accepts ``equal`` or ``behind`` on successful JSON.
+    Local-ahead (live pin carried past the configured remote) is current for
+    check/preflight: there is nothing to pull, and apply must not fast-forward.
+    """
+    return "equal" if topology == "ahead" else topology
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -564,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     output = {
         "ok": True,
-        "topology": probe.topology,
+        "topology": _desktop_reported_topology(probe.topology),
         "head": probe.head,
         "remote_tip": probe.remote_tip,
     }

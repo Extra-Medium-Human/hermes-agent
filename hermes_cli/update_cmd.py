@@ -568,7 +568,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ar
             print(f"✗ Update check refused [{code}]: {exc}")
             sys.exit(1)
         if authority_probe is not None:
-            if authority_probe.topology == "equal":
+            if authority_probe.topology in ("equal", "ahead"):
                 print("✓ Already up to date.")
             else:
                 count = _count_commits_between(
