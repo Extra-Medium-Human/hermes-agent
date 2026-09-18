@@ -195,12 +195,4 @@ native/fts5_cjk/*.so
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
 
-# Fork quality caches and generated evidence
-.quality-cache/
-.quality-results/
 
-.quality-checks/
-.quality-history/
-.quality-release-history/
-.quality-release/
-.quality/__pycache__/
