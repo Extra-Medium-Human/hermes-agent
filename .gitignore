@@ -196,3 +196,4 @@ native/fts5_cjk/*.so
 .lazy-refresh-incomplete
 
 
+.quality-cache/
