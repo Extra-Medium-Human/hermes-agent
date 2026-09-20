@@ -320,9 +320,29 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
     return [python_exe, str(path)], env_overlay, None
 
 
+def _cron_job_environment(job: Optional[dict]) -> dict[str, str]:
+    """Return the explicit model-call policy for one ``no_agent`` subprocess."""
+    if not job or not job.get("no_agent"):
+        return {}
+    job_id = str(job.get("id") or "unknown")
+    classification = (
+        str(job.get("spend_class") or "").strip().lower(),
+        str(job.get("model_calls") or "").strip().lower(),
+    )
+    if classification == ("pure_script", "forbidden"):
+        return {"HERMES_CRON_JOB_ID": job_id, "HERMES_MODEL_CALLS_FORBIDDEN": "1"}
+    if classification == ("model_backed", "governed"):
+        return {"HERMES_CRON_JOB_ID": job_id, "HERMES_MODEL_BACKGROUND": "1"}
+    raise ValueError(
+        f"no_agent job {job_id!r} requires explicit spend_class/model_calls: "
+        "pure_script/forbidden or model_backed/governed"
+    )
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    job: Optional[dict] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -334,6 +354,10 @@ def _run_job_script(
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396.
     """
+    try:
+        job_env = _cron_job_environment(job)
+    except ValueError as exc:
+        return False, f"Script execution blocked: {exc}"
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
@@ -370,6 +394,9 @@ def _run_job_script(
         # process env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        for key in ("HERMES_CRON_JOB_ID", "HERMES_MODEL_BACKGROUND", "HERMES_MODEL_CALLS_FORBIDDEN"):
+            env.pop(key, None)
+        env.update(job_env)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -452,7 +479,7 @@ def _run_job_script_with_claim_heartbeat(
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not (isinstance(schedule, dict) and schedule.get("kind") == "once" and owner):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job=job)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -470,10 +497,10 @@ def _run_job_script_with_claim_heartbeat(
             "Job '%s': could not start script run_claim heartbeat", job_id, exc_info=True),
     )
     if heartbeat_thread is None:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job=job)
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event, job=job)
     finally:
         stop.set()
         # Bounded join: the heartbeat may be blocked on another process's jobs-file lock.

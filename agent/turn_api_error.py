@@ -77,6 +77,35 @@ def handle_api_error(
     if agent.thinking_callback:
         agent.thinking_callback("")
 
+    # Local spend denials are control-flow, not provider failures. Do not feed them through
+    # generic retry/compression classification: provider-wide exhaustion may use one configured
+    # fallback, while session/repeated-context exhaustion terminates this turn with guidance.
+    from agent.model_spend_governor import BudgetExceeded
+    if isinstance(api_error, BudgetExceeded):
+        if api_error.fallback_recommended:
+            if agent._try_activate_fallback():
+                from agent.conversation_loop import _arm_fallback_restart
+                active_system_prompt = _arm_fallback_restart(
+                    agent, api_messages, active_system_prompt, _retry)
+                retry_count = 0
+                compression_attempts = 0
+                agent._buffer_diagnostic_status(
+                    f"⚠️ {api_error} Switched to configured fallback."
+                )
+                return _verdict("break")
+        summary = str(api_error)
+        return _verdict("return", {
+            "final_response": summary,
+            "messages": messages,
+            "api_calls": api_call_count,
+            "completed": False,
+            "failed": True,
+            "error": summary,
+            "failure_reason": "model_spend_budget",
+            "failure_retryable": False,
+            "model_spend_code": api_error.code,
+        })
+
     _recovered, active_system_prompt = recover_before_classification(
         agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
         active_system_prompt=active_system_prompt,

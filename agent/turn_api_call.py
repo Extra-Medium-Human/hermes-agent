@@ -120,6 +120,24 @@ def perform_api_call(
         )
 
     from hermes_cli.middleware import run_llm_execution_middleware
+    from agent.model_spend_governor import guarded_model_call
+
+    call_role = (
+        "delegated"
+        if getattr(agent, "is_subagent", False)
+        else "fallback"
+        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+        else "primary"
+    )
+
+    def _run_with_middleware(request):
+        return run_llm_execution_middleware(
+            request, _perform_api_call, original_request=_original_api_kwargs,
+            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
+            provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
+            api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
+        )
 
     # The ``_model_request_active`` bracket is taken under the redirect lock when one exists,
     # so redirect() can't observe a half-toggled flag.
@@ -130,12 +148,10 @@ def perform_api_call(
         if _model_request_active is not None:
             _model_request_active.set()
     try:
-        response = run_llm_execution_middleware(
-            api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
-            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
-            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
-            provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
-            api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
+        response = guarded_model_call(
+            api_kwargs, _run_with_middleware,
+            provider=agent.provider, model=agent.model, session_id=agent.session_id or "",
+            platform=agent.platform or "", role=call_role, task=effective_task_id,
         )
     finally:
         with _bracket:

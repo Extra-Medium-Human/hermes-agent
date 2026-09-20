@@ -2597,13 +2597,27 @@ def _relay_sync_completion(
     # Isolate only the provider callback so the owning thread can unwind its lease/DB
     # transaction on hard cancel without touching the shared client.
     if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
-    return relay_llm.execute_current(
-        kwargs, lambda request: _run_protected_sync_provider_call(callback, request),
-        name=provider_name, model_name=str(kwargs.get("model") or fallback_model),
-        metadata=metadata, defer_logical_completion=True,
+        provider_name = str(provider or "auxiliary")
+        fallback_model = str(kwargs.get("model") or "unknown")
+        metadata = {"call_role": "auxiliary:other", "auxiliary_task": "other"}
+        execute = lambda request: _run_protected_sync_provider_call(callback, request)
+    else:
+        provider_name, fallback_model, metadata = route
+        from agent import relay_llm
+        execute = lambda request: relay_llm.execute_current(
+            request, lambda current: _run_protected_sync_provider_call(callback, current),
+            name=provider_name, model_name=str(request.get("model") or fallback_model),
+            metadata=metadata, defer_logical_completion=True,
+        )
+    from agent.model_spend_governor import guarded_model_call
+    from gateway.session_context import get_session_env
+    return guarded_model_call(
+        kwargs, execute, provider=provider_name,
+        model=str(kwargs.get("model") or fallback_model),
+        session_id=_runtime_main_value("session_id") or get_session_env("HERMES_SESSION_ID") or "auxiliary",
+        platform=(get_session_env("HERMES_SESSION_PLATFORM")
+                  or get_session_env("HERMES_SESSION_SOURCE") or "auxiliary"),
+        role=str(metadata["call_role"]), task=str(metadata["auxiliary_task"]),
     )
 
 
@@ -2618,12 +2632,31 @@ async def _relay_async_completion(
     callback = create or (lambda request: _acreate_with_progress(client, request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return await callback(kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
-    return await relay_llm.execute_current_async(
-        kwargs, callback, name=provider_name, model_name=str(kwargs.get("model") or fallback_model),
-        metadata=metadata, defer_logical_completion=True,
+        provider_name = str(provider or "auxiliary")
+        fallback_model = str(kwargs.get("model") or "unknown")
+        metadata = {"call_role": "auxiliary:other", "auxiliary_task": "other"}
+
+        async def guarded_execute(request):
+            return await callback(request)
+    else:
+        provider_name, fallback_model, metadata = route
+        from agent import relay_llm
+
+        async def guarded_execute(request):
+            return await relay_llm.execute_current_async(
+                request, callback, name=provider_name,
+                model_name=str(request.get("model") or fallback_model),
+                metadata=metadata, defer_logical_completion=True,
+            )
+    from agent.model_spend_governor import guarded_model_call_async
+    from gateway.session_context import get_session_env
+    return await guarded_model_call_async(
+        kwargs, guarded_execute, provider=provider_name,
+        model=str(kwargs.get("model") or fallback_model),
+        session_id=_runtime_main_value("session_id") or get_session_env("HERMES_SESSION_ID") or "auxiliary",
+        platform=(get_session_env("HERMES_SESSION_PLATFORM")
+                  or get_session_env("HERMES_SESSION_SOURCE") or "auxiliary"),
+        role=str(metadata["call_role"]), task=str(metadata["auxiliary_task"]),
     )
 
 

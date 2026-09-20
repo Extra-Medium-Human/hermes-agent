@@ -270,6 +270,44 @@ DEFAULT_CONFIG = {
         "turn_liveness": {"timeout_s": 600.0, "poll_s": 15.0},
     },
 
+    # Fail-closed accounting for every provider/model request. Provider budgets are shared
+    # across profiles; session limits stop one conversation from repeatedly exhausting them.
+    "spend_governor": {
+        "enabled": True,
+        "fail_closed": True,
+        # A crashed request must not hold the shared background-concurrency slot forever.
+        # This exceeds every normal provider HTTP timeout while allowing eventual recovery.
+        "reservation_stale_seconds": 600,
+        "provider": {
+            "max_calls_per_hour": 50,
+            "max_calls_per_day": 150,
+            "max_tokens_per_hour": 2_000_000,
+            "max_tokens_per_day": 6_000_000,
+        },
+        "session": {
+            "max_calls": 60,
+            "max_total_tokens": 2_000_000,
+            "repeated_request_limit": 4,
+        },
+        "background": {
+            "max_concurrent": 1,
+            "max_calls_per_hour": 8,
+            "max_calls_per_day": 40,
+            "max_tokens_per_hour": 300_000,
+            "max_tokens_per_day": 1_500_000,
+        },
+        "quota": {
+            "poll_seconds": 60,
+            "background_block_percent": 80.0,
+            "foreground_fallback_percent": 95.0,
+        },
+        "alerts": {
+            "threshold_percent": 80.0,
+            "cooldown_seconds": 3600,
+            "operator_target": "",
+        },
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
