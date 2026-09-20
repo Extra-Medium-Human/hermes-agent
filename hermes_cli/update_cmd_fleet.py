@@ -342,8 +342,11 @@ def _superseded_marker_has_current_gateway_successor() -> bool:
         logger.debug("Could not reconcile superseded fleet marker: %s", exc)
         return False
 
-def _update_owes_fleet_restart() -> bool:
-    """Startup-warning semantics: does the LAST UPDATE still owe the fleet a restart?
+def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: list[dict] | None = None) -> bool:
+    """Hold a completed restart to the code it pulled, not a later checkout HEAD."""
+    from hermes_cli.update_cmd import _current_checkout_sha
+    from hermes_cli.update_receipt import read_latest_receipt
+    from hermes_cli.update_serve_obligations import retain_receipt_manual_serves
 
     if receipt is None:
         receipt = read_latest_receipt() or {}
@@ -381,7 +384,12 @@ def _warn_pending_fleet_restart_on_startup() -> None:
     receipt = read_latest_receipt() or {}
     pending_manual = None
     with suppress(Exception):
-        if _update_owes_fleet_restart() and not _superseded_marker_has_current_gateway_successor():
+        pending_manual = retain_receipt_manual_serves(receipt)
+    with suppress(Exception):
+        if (
+            _update_owes_fleet_restart(receipt=receipt, pending_manual=pending_manual)
+            and not _superseded_marker_has_current_gateway_successor()
+        ):
             _warn_pending_fleet_restart(startup=True)
     with suppress(Exception):
         warn_pending_manual_serves(startup=True, pending_manual=pending_manual)
