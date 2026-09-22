@@ -2680,10 +2680,15 @@ def _relay_sync_stream(
         return create(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
-    return relay_llm.stream_current(
-        kwargs, create, name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model), finalizer=dict, metadata=metadata,
-        completed_response_predicate=lambda value: hasattr(value, "choices"),
+    from agent.auxiliary_hooks import run_with_aux_hooks
+    model_name = str(kwargs.get("model") or fallback_model)
+    return run_with_aux_hooks(
+        lambda: relay_llm.stream_current(
+            kwargs, create, name=provider_name, model_name=model_name, finalizer=dict,
+            metadata=metadata, completed_response_predicate=lambda value: hasattr(value, "choices"),
+        ),
+        aux_task=str(metadata.get("auxiliary_task") or ""), metadata=metadata, client=client, kwargs=kwargs,
+        provider=provider_name, model=model_name, api_mode=str(metadata.get("api_mode") or ""), streaming=True,
     )
 
 
