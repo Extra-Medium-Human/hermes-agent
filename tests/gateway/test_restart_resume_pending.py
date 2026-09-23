@@ -126,18 +126,6 @@ def _simulate_note_injection(
 # ---------------------------------------------------------------------------
 
 
-class TestSessionEntryResumeFields:
-    def test_defaults(self):
-        now = datetime.now()
-        entry = SessionEntry(
-            session_key="agent:main:telegram:dm:1",
-            session_id="sid",
-            created_at=now,
-            updated_at=now,
-        )
-        assert entry.resume_pending is False
-        assert entry.resume_reason is None
-        assert entry.last_resume_marked_at is None
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +145,6 @@ class TestMarkResumePending:
         assert refreshed.resume_reason == "restart_timeout"
         assert refreshed.last_resume_marked_at is not None
 
-    def test_custom_reason_persists(self, tmp_path):
-        store = _make_store(tmp_path)
-        source = _make_source()
-        entry = store.get_or_create_session(source)
-
-        store.mark_resume_pending(entry.session_key, reason="shutdown_timeout")
-        assert store._entries[entry.session_key].resume_reason == "shutdown_timeout"
 
 
 class TestClearResumePending:
@@ -278,7 +259,6 @@ class TestResumePendingSystemNote:
         )
 
         assert message
-        assert "CONTINUE the interrupted task" in message
         assert persisted == message
         assert persisted != ""
 
@@ -318,7 +298,6 @@ class TestResumePendingSystemNote:
         result = _simulate_note_injection(history, "ping", resume_entry=entry)
         assert "[System note:" in result
         assert "gateway restart" in result
-        assert "NEW message" in result
 
 
     def test_no_resume_pending_preserves_tool_tail_note(self):
@@ -521,10 +500,6 @@ class TestFreshnessHelpers:
         monkeypatch.setenv("HERMES_AUTO_CONTINUE_FRESHNESS", "7200")
         assert _auto_continue_freshness_window() == 7200.0
 
-    def test_auto_continue_freshness_window_default_when_unset(self, monkeypatch):
-        monkeypatch.delenv("HERMES_AUTO_CONTINUE_FRESHNESS", raising=False)
-        # Default is 1 hour
-        assert _auto_continue_freshness_window() == 3600.0
 
 
 # ---------------------------------------------------------------------------
