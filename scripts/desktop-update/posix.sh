@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # posix.sh -- repo-owned macOS/Linux Desktop update hand-off.
 #
 # The whole job: wait for the Desktop to exit, run `hermes update`, tell the
@@ -11,7 +11,7 @@
 # CONTRACT (keep in sync with apps/desktop/electron/main.ts):
 #   bash scripts/desktop-update/posix.sh
 #     --install-root <path>    repo checkout (HERMES_HOME/hermes-agent)
-#     --branch <ref>           branch to update against
+#     [--branch <ref> | --channel stable|canary|main]  default: branch main
 #     --desktop-pid <pid>      the Electron main process to wait out
 #     [--relaunch-target <p>]  mac: running .app to swap+reopen;
 #                              linux: running binary (omit = no relaunch)
@@ -48,7 +48,13 @@ HANDOFF_DAEMONIZED=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --install-root) INSTALL_ROOT="$2"; shift 2 ;;
-    --branch) BRANCH="$2"; shift 2 ;;
+    --branch) BRANCH="$2"; BRANCH_EXPLICIT=1; shift 2 ;;
+    --channel)
+      case "${2:-}" in
+        stable|canary|main) CHANNEL="$2" ;;
+        *) echo "--channel must be stable, canary, or main" >&2; exit 64 ;;
+      esac
+      shift 2 ;;
     --desktop-pid) DESKTOP_PID="$2"; shift 2 ;;
     --authority-remote) AUTHORITY_REMOTE="$2"; shift 2 ;;
     --authority-remote-url) AUTHORITY_REMOTE_URL="$2"; shift 2 ;;
@@ -74,10 +80,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ "$SELF_TEST_UI" -eq 1 ] || [ -n "$INSTALL_ROOT" ] || { echo "--install-root is required" >&2; exit 64; }
+[ "$BRANCH_EXPLICIT" -eq 0 ] || [ -z "$CHANNEL" ] || { echo "--branch and --channel are mutually exclusive" >&2; exit 64; }
+TARGET_ARGS=(--branch "$BRANCH")
+[ -z "$CHANNEL" ] || TARGET_ARGS=(--channel "$CHANNEL")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HERMES_HOME="${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}"
+HERMES_HOME="${HERMES_HOME:-${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}}"
 HERMES_HOME="${HERMES_HOME:-${TMPDIR:-/tmp}}"
+export HERMES_HOME
 MARKER="$HERMES_HOME/.hermes-update-in-progress"
 LOG_DIR="$HERMES_HOME/logs"; mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG="$LOG_DIR/desktop-update-handoff.log"
@@ -85,7 +95,7 @@ RESULT="$HERMES_HOME/.hermes-update-result.json"
 STATUS="${TMPDIR:-/tmp}/hermes-update-status.$$"
 STARTED_AT="$(date +%s)"  # the shim's elapsed clock; see serve-ui.py
 
-UI_SERVER_PID="" UI_BROWSER_PID="" UI_PROFILE_DIR="" FINAL_CODE=1
+UI_SERVER_PID="" UI_BROWSER_PID="" UI_PANEL_PID="" UI_PROFILE_DIR="" FINAL_CODE=1
 FINAL_MSG="update did not complete"
 DONE_NOTE=""  # set when the update succeeded but the app will NOT reopen itself
 
@@ -227,6 +237,21 @@ default_browser_is_chromium() {
   esac
 }
 
+start_status_panel() { # the macOS no-browser shim: osascript (JXA) panel.
+  # Best-effort by design: osascript missing or the panel exiting instantly
+  # (syntax, headless session) just means no UI, exactly as before. The panel
+  # polls $STATUS itself and self-exits after a terminal state, so this pid
+  # only needs killing on OUR early teardown paths.
+  local py="$1" panel="$SCRIPT_DIR/update-panel.js"
+  [ -n "$py" ] || py="/usr/bin/python3"  # unused by osascript; keeps the wrapper shape
+  "$py" -c 'import os, signal, sys; os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); os.execv(sys.argv[1], sys.argv[1:])' \
+    /usr/bin/osascript -l JavaScript "$panel" "$STATUS" >>"$LOG" 2>&1 &
+  UI_PANEL_PID=$!
+  sleep 1
+  kill -0 "$UI_PANEL_PID" 2>/dev/null || { UI_PANEL_PID=""; return; }
+  log "shim: status panel pid=$UI_PANEL_PID"
+}
+
 start_ui() {
   [ "$NO_UI" -eq 1 ] && return
   local html="$SCRIPT_DIR/ui.html" py browser port="" i
@@ -236,6 +261,14 @@ start_ui() {
   if [ -n "$browser" ] && ! default_browser_is_chromium; then
     log "shim: default browser is not Chromium-family; skipping UI window"
     browser=""
+  fi
+  if [ "$(uname)" = "Darwin" ] && [ -z "$browser" ] && [ -f "$SCRIPT_DIR/update-panel.js" ]; then
+    # No Chromium renderer may host ui.html (Safari/Firefox default, or no
+    # Chrome): draw the same progress as a native panel instead. Reads the
+    # same $STATUS JSON — no server, no browser, no other-app scripting.
+    start_status_panel "$py"
+    [ -n "$UI_PANEL_PID" ] && return
+    log "shim: status panel did not start; continuing without UI"
   fi
   { [ -f "$html" ] && [ -n "$py" ] && [ -n "$browser" ]; } || { log "shim: no renderer; skipping UI"; return; }
 
@@ -289,11 +322,17 @@ stop_ui() { # error/manual outcomes keep the window up briefly so a watching
   if [ -n "$UI_BROWSER_PID" ]; then
     { kill "$UI_BROWSER_PID" && wait "$UI_BROWSER_PID"; } 2>/dev/null
   fi
+  if [ -n "$UI_PANEL_PID" ]; then
+    # The panel ignores TERM (SIG_IGN survives execv, same contract as the
+    # HTTP server) — KILL is its off switch. leave-window grace is the panel's
+    # own delay terminal-state sleep, so we just end it.
+    { kill -9 "$UI_PANEL_PID" && wait "$UI_PANEL_PID"; } 2>/dev/null
+  fi
   if [ -n "$UI_PROFILE_DIR" ]; then
     rm -rf "$UI_PROFILE_DIR" 2>/dev/null || true
     UI_PROFILE_DIR=""
   fi
-  UI_SERVER_PID="" UI_BROWSER_PID=""
+  UI_SERVER_PID="" UI_BROWSER_PID="" UI_PANEL_PID=""
 }
 
 # ── relaunch ────────────────────────────────────────────────────────────────
@@ -795,11 +834,32 @@ if [ "$(uname)" = "Darwin" ]; then
   else
     log "TCC anchor self-heal could not repair the venv ($TCC_HEAL_STATE)"
   fi
-fi
-tcc_pick_update_invoke "$INSTALL_ROOT/venv/bin"
-if [ "${UPDATE_INVOKE[0]}" != "$HERMES_BIN" ]; then
-  log "venv/bin/python3 still unbootable; invoking the update via ${UPDATE_INVOKE[*]}"
-fi
+  if [ -f "$INSTALL_ROOT/hermes_cli/_launchers.py" ]; then
+    local candidate version reported expected
+    expected="$(cd "$INSTALL_ROOT" && pwd -P)" || return 1
+    for candidate in "$HOME/.local/bin/hermes" "$HERMES_HOME/bin/hermes"; do
+      [ -x "$candidate" ] || continue
+      version="$("$candidate" --version 2>/dev/null)" || continue
+      reported="$(printf '%s\n' "$version" | sed -n 's/^Install directory: //p')"
+      [ -d "$reported" ] || continue
+      [ "$(cd "$reported" && pwd -P)" = "$expected" ] || continue
+      HERMES_BIN="$candidate"
+      UPDATE_INVOKE=("$candidate")
+      return 0
+    done
+  fi
+  if [ "$LEGACY_INSTALL" -eq 1 ] && [ ! -d "$INSTALL_ROOT/pm" ]; then
+    HERMES_BIN="$INSTALL_ROOT/venv/bin/hermes"
+    [ -x "$HERMES_BIN" ] || return 1
+    if [ "$(uname)" = Darwin ]; then
+      tcc_anchor_heal "$INSTALL_ROOT/venv/bin" || log "TCC anchor rescue failed ($TCC_HEAL_STATE)"
+    fi
+    tcc_pick_update_invoke "$INSTALL_ROOT/venv/bin"
+    return 0
+  fi
+  return 1
+}
+select_update_invoke || { FINAL_CODE=3 FINAL_MSG="Update aborted: the installation launcher at $HERMES_BIN is missing. Repair this installation."; log "$FINAL_MSG"; exit 3; }
 
 # Run FROM the install root: `hermes update` resolves the tree it mutates
 # from the working directory, and we inherit the Desktop's cwd (which can be
@@ -812,6 +872,11 @@ cd "$INSTALL_ROOT" || {
   log "$FINAL_MSG"; exit 3
 }
 export PYTHONUNBUFFERED=1
+# The takeover children (hermes update -> _update_takeover/update_finish and
+# the PM sync / build stages they drive) publish their stages back into the
+# shim's UI through this file; without a watching UI the variable is simply
+# absent and the helper no-ops.
+export HERMES_UPDATE_STATUS_FILE="$STATUS"
 # --keep-stash: never re-apply local source edits after the update (they stay
 # parked in git stash). Probe --help first: older installed backends don't
 # know the flag and argparse would abort with exit 2, which collides with the
@@ -863,10 +928,9 @@ if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ] && [ -z "$AUTHORITY_TOKEN" ]; then
 fi
 trap 'on_signal TERM' TERM
 
-# Truthful completion: `hermes update` calls a GUI build failure non-fatal
-# (exit 0). For a Desktop-driven update that would relaunch the OLD build
-# and call it success -- retry the build once, propagate honestly.
-if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "Desktop build failed"; then
+# Pre-PM update code could report a failed desktop build with exit zero.
+# Current composition propagates failure and never enters this legacy repair.
+if [ "$LEGACY_INSTALL" -eq 1 ] && [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "Desktop build failed"; then
   log "desktop build failed inside hermes update; retrying build"
   publish_stage "Rebuilding Desktop"
   "${UPDATE_INVOKE[@]}" desktop --force-build --build-only >> "$LOG" 2>&1 || {
@@ -881,7 +945,7 @@ else
   # The bricked-venv class is fixable and must not read as a generic exit 1:
   # a dead interpreter with a failed/impossible heal means retrying can never
   # succeed — tell the user what is actually wrong (#95759).
-  if ! tcc_probe_python "$INSTALL_ROOT/venv/bin/python3" \
+  if [ "$LEGACY_INSTALL" -eq 1 ] && ! tcc_probe_python "$INSTALL_ROOT/venv/bin/python3" \
       && ! tcc_probe_python "$INSTALL_ROOT/venv/bin/python"; then
     FINAL_MSG="Update failed: the Python interpreter inside $INSTALL_ROOT/venv cannot start (heal state: $TCC_HEAL_STATE). Reinstall the runtime with the Hermes installer, or run hermes doctor --fix from a terminal if any hermes command still works."
   fi
