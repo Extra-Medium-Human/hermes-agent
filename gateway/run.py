@@ -47,6 +47,7 @@ from gateway.resume_recovery import (
     build_resume_recovery_note as build_resume_recovery_note,
     prepare_resume_pending_message as _prepare_resume_pending_message,
 )
+from gateway.turn_executor import _UnboundedThreadExecutor
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
