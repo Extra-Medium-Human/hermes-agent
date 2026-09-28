@@ -250,8 +250,10 @@ import {
   resolveGatewayFileBackend,
   saveGatewayDownload
 } from './gateway-file-download'
+import { downloadViaOauthSessionToFile, downloadViaTokenToFile } from './gateway-file-download-transport'
 import { stopGatewayBeforeUpdate } from './gateway-stop-before-update'
-import { probeGatewayWebSocket } from './gateway-ws-probe'
+import { resolveGatewayVersion } from './gateway-version'
+import { probeGatewayWebSocket, spawnedBackendProbeOptions } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
 import { desktopBackendSpawnEnv, guestOnboardingEnabled, skipIntroEnabled } from './guest-onboarding'
 import { readAndConsumeHandoffResult } from './handoff-result'
@@ -492,7 +494,6 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
-import { branchTipApiUrl, compareApiUrl, parseCompare } from './update-api-check'
 import {
   authorityBoundManualUpdateCommand,
   authorityPreflightInvocation,
@@ -511,12 +512,34 @@ import {
   type UpdaterStrategy
 } from './updater'
 import {
+  collectRelaunchArgs,
   observeUpdaterHandoff,
+  resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
+  resolveVenvDir,
   sandboxFallbackFromEnv,
   spawnUpdaterProcess
 } from './updater-process'
+import { AppInstallerStrategy, createChannelAppInstallerStrategy } from './updater/app-installer'
+import { ChannelResolver, type ChannelTarget } from './updater/channel'
+import { inspectRunningChannelApp } from './updater/channel-native'
+import { ChannelStrategy } from './updater/channel-strategy'
+import { verifyPreparedChannelInstaller } from './updater/channel-windows-host'
+import { createCheckoutStrategy } from './updater/checkout'
+import { readSourceUpdate, type SourceUpdate } from './updater/checkout-source'
+import { ExternalStrategy } from './updater/external'
+import { readUpdatesFeedBaseFromConfig, resolveFeedBaseUrl } from './updater/feed-config'
+import { createChannelMacStrategy, createMacStrategy } from './updater/mac-client'
+import {
+  type ConsumedRelaunch,
+  consumePendingRelaunch,
+  registerUpdateRelaunch,
+  type RelaunchRegistration
+} from './updater/relaunch'
+import { startRelaunchWaiter } from './updater/relaunch-waiter'
+import { preflightStateDb as preflightStateDbModern } from './updater/state-db-preflight'
+import { createStoreStrategy } from './updater/store-client'
 import { isHermesOwnedVenvDaemon } from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
@@ -542,11 +565,7 @@ import {
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
 import { hiddenWindowsChildOptions } from './windows-child-options'
-import {
-  buildPathExtCandidates,
-  getVenvSitePackagesEntries,
-  resolveVenvHermesCommand
-} from './windows-hermes-path'
+import { buildPathExtCandidates, resolveVenvHermesCommand } from './windows-hermes-path'
 import {
   connectWindowsRemote,
   detectRemotePlatform,
@@ -906,6 +925,13 @@ const HERMES_HOME: string = resolveDesktopHermesHome({
   }
 }
 
+function pathWithHermesManagedNode(...entries: Array<string | undefined>): string {
+  const managed: string[] = [path.join(HERMES_HOME, 'node', 'bin'), path.join(HERMES_HOME, 'node')].filter(
+    directoryExists
+  )
+  return [...managed, ...entries, process.env.PATH].filter(Boolean).join(path.delimiter)
+}
+
 // ACTIVE_HERMES_ROOT — the canonical mutable Hermes install. Same path
 // install.ps1 / install.sh use, so a desktop-only user and a CLI-only user end
 // up with identical layouts and can share one install.
@@ -950,6 +976,7 @@ const DESKTOP_MANAGED_SSH_RECOVERY_PATH = path.join(app.getPath('userData'), 'ma
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const DEFAULT_UPDATE_BRANCH = 'main'
 // desktop.log lives under HERMES_HOME/logs/ so it sits next to agent.log,
 // errors.log, gateway.log produced by hermes_logging.setup_logging — one log
 // directory per user, regardless of which UI surface produced the line.
@@ -3240,7 +3267,7 @@ function runCapturedProcess(
   })
 }
 
-function updateAuthorityPython(updateRoot: string) {
+async function updateAuthorityPython(updateRoot: string): Promise<string | null> {
   const candidates = [
     path.join(updateRoot, 'venv', 'bin', 'python3'),
     path.join(updateRoot, 'venv', 'bin', 'python'),
@@ -3254,7 +3281,7 @@ async function runDesktopAuthorityProbe(
   authority: UpdateAuthority,
   values: { action: 'check' | 'preflight' | 'validate'; nonce: string; ownerPid: number; tokenPath?: string }
 ) {
-  const invocation = authorityPreflightInvocation(updateAuthorityPython(updateRoot), authority, values)
+  const invocation = authorityPreflightInvocation(await updateAuthorityPython(updateRoot), authority, values)
   const output = await runCapturedProcess(invocation.command, invocation.args, {
     cwd: updateRoot,
     env: {
@@ -3268,7 +3295,7 @@ async function runDesktopAuthorityProbe(
 
 async function createDesktopStateSnapshot(updateRoot: string, nonce: string) {
   const output = await runCapturedProcess(
-    updateAuthorityPython(updateRoot),
+    await updateAuthorityPython(updateRoot),
     ['-m', 'hermes_cli.update_state_snapshot', 'snapshot', '--home', HERMES_HOME, '--nonce', nonce],
     {
       cwd: updateRoot,
@@ -3325,7 +3352,7 @@ async function waitForAuthorityHandoffReady(
   }
 }
 
-const firstLine = text => (text || '').split('\n').find(Boolean) || ''
+const firstLine = (text: string): string => (text || '').split('\n').find(Boolean) || ''
 
 function emitUpdateProgress(payload) {
   const merged = { stage: 'idle', message: '', percent: null, error: null, ...payload, at: Date.now() }
@@ -3414,6 +3441,8 @@ async function checkUpdates({ force: _force = false }: { force?: boolean } = {})
     fetchedAt: Date.now()
   }
 }
+
+let updateInFlight = false
 
 async function createPackagedUpdateStrategy(): Promise<UpdaterStrategy | null> {
   const mechanism = resolveUpdaterMechanism({
@@ -3621,7 +3650,7 @@ function resolveCheckoutUpdateStrategy(): UpdaterStrategy {
         return
       }
 
-      preflightStateDb({
+      preflightStateDbModern({
         python: await findPythonForRoot(root),
         script: path.join(root, 'hermes_cli', 'backup_sqlite.py'),
         home,
@@ -4784,38 +4813,27 @@ async function applyUpdatesPosixHandoff(opts: any) {
   ]
   const updateStartedAt = Math.floor(Date.now() / 1000)
 
-  if (handoffConflict) {
-    // Same hazard as applyUpdates (#75778): a live foreign updater already
-    // owns the marker. Spawning another here would overwrite its claim and
-    // race a second updater over the same install tree. The live updater
-    // is already working on this exact install and will restart us when
-    // it finishes, so treat this the same as a successful hand-off instead
-    // of clobbering it with our own.
-    rememberLog(`[bootstrap] refusing recovery hand-off: ${handoffConflict.message}`)
-    isQuittingForHandoff = true
-    setTimeout(() => {
-      app.quit()
-    }, UPDATE_HANDOFF_DWELL_MS)
-
-    return true
+  const targetApp = IS_MAC ? runningAppBundle() : process.execPath
+  if (targetApp) {
+    args.push('--relaunch-target', targetApp)
   }
-
-  const updateRoot = resolveUpdateRoot()
-  const { branch: configuredBranch } = readDesktopUpdateConfig()
-
-  // Recovery can run without Python. Keep the chosen branch; do not guess a replacement.
-  const branch: string = configuredBranch || DEFAULT_UPDATE_BRANCH
-
-  const updaterArgs: string[] = chooseUpdaterArgs({ runtimeUsable: await isSourceRuntimeUsable(updateRoot) }, branch)
-
-  await stopBackendsForUpdate()
-
-  const child = spawnUpdaterProcess(updater, updaterArgs, {
+  const relaunchArgs = collectRelaunchArgs(process.argv.slice(1))
+  if (!IS_MAC) {
+    args.push('--relaunch-cwd', process.cwd())
+    if (sandboxFallbackFromEnv(process.env, relaunchArgs)) {
+      args.push('--sandbox-fallback')
+    }
+    if (relaunchArgs.length) {
+      args.push('--', ...relaunchArgs)
+    }
+  }
+  const child = spawnUpdaterProcess(handoff.command, args, {
     cwd: HERMES_HOME,
     env: {
       ...process.env,
       HERMES_HOME,
-      HERMES_INSTALL_ROOT: updateRoot
+      HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
+      PATH: pathWithHermesManagedNode(path.join(resolveVenvDir(updateRoot), 'bin'))
     },
     detached: true,
     stdio: 'ignore'
@@ -4887,22 +4905,6 @@ async function applyUpdatesPosixHandoff(opts: any) {
   )
 
   return true
-}
-
-// The running app's .app bundle (packaged macOS): execPath is
-// <App>.app/Contents/MacOS/<exe>; climb three levels to the bundle root.
-function runningAppBundle() {
-  if (!IS_MAC) {
-    return null
-  }
-
-  let dir = path.dirname(app.getPath('exe')) // .../Contents/MacOS
-
-  for (let i = 0; i < 2; i++) {
-    dir = path.dirname(dir)
-  } // -> .../X.app
-
-  return dir.endsWith('.app') ? dir : null
 }
 
 // macOS/Linux update hand-off: spawn the repo-owned posix orchestrator
@@ -13037,8 +13039,6 @@ function reportPrimaryRecoveryCrashLoop(code: number | null, signal: string | nu
   return true
 }
 
-const firstLine = (text: string): string => (text || '').split('\n').find(Boolean) || ''
-
 function runPrimaryRecoverySpawn(code: number | null, signal: string | null) {
   startHermes({ supervisorRecovery: true }).catch(respawnError => {
     rememberLog(`[supervisor] backend respawn failed: ${firstLine(respawnError.message)}`)
@@ -18322,24 +18322,6 @@ ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
   writeDesktopUpdateConfig(next)
   return next
 })
-
-// Resolve the canonical Hermes version (the one `release.py` bumps in
-// hermes_cli/__init__.py + pyproject.toml) so the desktop About panel shows the
-// real Hermes version instead of the Electron app's own package.json version,
-// which historically drifted (stuck at 0.0.2). Falls back to app.getVersion()
-// when the source tree can't be read (e.g. a packaged build without the repo).
-function resolveHermesVersion() {
-  try {
-    const root = resolveUpdateRoot()
-    const initPath = path.join(root, 'hermes_cli', '__init__.py')
-
-    if (fileExists(initPath)) {
-      const raw = fs.readFileSync(initPath, 'utf8')
-      const match = raw.match(/__version__\s*=\s*["']([^"']+)["']/)
-
-    return { branch }
-  }
-)
 
 function resolveHermesVersion(scope: { connectionId?: string; profile?: string } = {}): Promise<string> {
   return resolveGatewayVersion(path => handleHermesApiRequest({ ...scope, path, timeoutMs: 5000 }))

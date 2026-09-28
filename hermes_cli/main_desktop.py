@@ -1225,14 +1225,18 @@ def _promote_staged_desktop_app(
         print(_PREVIOUS_APP_KEPT)
         sys.exit(1)
 
-    # Windows integrity gate: never declare the rebuild a success on a
-    # Hermes.exe Windows cannot load. Verified on the STAGED exe, so a failure
-    # simply discards staging and fails loudly for the updater's retry-once.
-    verified_executable, rolled_back = _ensure_desktop_exe_launchable(desktop_dir, staged_executable)
-    if rolled_back or verified_executable is None:
+    # Validate only staging. The swap owns live-app rollback; raw in-place
+    # pack backups are not part of this transaction.
+    if integrity_check is None and sys.platform == "win32":
+        integrity_check = _desktop_exe_integrity_error
+    error = integrity_check(staged_executable) if integrity_check is not None else None
+    if error is not None:
         _discard_desktop_staging(staging_dir)
-        print(_PREVIOUS_APP_KEPT)
-        sys.exit(1)
+        print(
+            f"✗ The built {staged_executable.name} failed its integrity check: {error}\n"
+            f"    at: {staged_executable}"
+        )
+        raise RuntimeError(f"Desktop build produced no launchable app. {_PREVIOUS_APP_KEPT}")
     packaged_executable = _swap_staged_desktop_app(desktop_dir, staging_dir)
     if packaged_executable is None:
         print(f"✗ Could not install the rebuilt desktop app into {desktop_dir / 'release'}")
@@ -1561,5 +1565,4 @@ def _launch_bundled_desktop(
     pid = launch_detached(launch_command, env=env, cwd=layout.app_root)
     print(f"→ Launched Hermes Desktop: {' '.join(launch_command)} (pid {pid})")
     sys.exit(0)
-
 
