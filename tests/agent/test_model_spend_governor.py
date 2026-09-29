@@ -290,20 +290,31 @@ def test_stale_background_reservation_does_not_permanently_block(tmp_path):
 
 
 def test_named_profile_reads_shared_root_governor_policy(tmp_path, monkeypatch):
-    import yaml
+    import builtins
+
+    import hermes_yaml
     from agent.model_spend_governor import governor_config
 
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "comms"
     profile.mkdir(parents=True)
     (root / "config.yaml").write_text(
-        yaml.safe_dump({"spend_governor": {"provider": {"max_calls_per_day": 9}}}),
+        hermes_yaml.safe_dump({"spend_governor": {"provider": {"max_calls_per_day": 9}}}),
         encoding="utf-8",
     )
     (profile / "config.yaml").write_text(
-        yaml.safe_dump({"model": {"provider": "openai-codex"}}), encoding="utf-8"
+        hermes_yaml.safe_dump({"model": {"provider": "openai-codex"}}), encoding="utf-8"
     )
     monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    real_import = builtins.__import__
+
+    def import_without_pyyaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ModuleNotFoundError("No module named 'yaml'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_pyyaml)
 
     assert governor_config()["provider"]["max_calls_per_day"] == 9
 

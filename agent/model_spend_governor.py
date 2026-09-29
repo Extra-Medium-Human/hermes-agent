@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Optional, TypeVar
 
+import hermes_yaml
 from hermes_constants import get_hermes_home
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 
@@ -100,8 +101,11 @@ def _load_yaml_config() -> dict[str, Any]:
         # malformed config is a fail-closed configuration error.
         return {}
     try:
-        import yaml
-        parsed = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        # Use Hermes's required YAML runtime rather than the optional PyYAML package. The
+        # bundled macOS interpreter intentionally ships ruamel.yaml but not ``yaml``; importing
+        # PyYAML here made every model call fail closed even though the same config had already
+        # been parsed successfully by the rest of Hermes.
+        parsed = hermes_yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         return parsed if isinstance(parsed, dict) else {}
     except Exception as exc:
         raise BudgetExceeded(
