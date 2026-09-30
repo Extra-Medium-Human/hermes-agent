@@ -121,7 +121,7 @@ def test_routed_location_writes_only_routed_profile(tmp_path, monkeypatch, caplo
     adapter._owner_profile = "transport-owner"
     _prepare_profile(tmp_path, "routed-profile")
     adapter.gateway_runner = SimpleNamespace(
-        _profile_name_for_source=lambda _source: "routed-profile"
+        _profile_name_for_source=lambda _source, *, adapter_profile=None: "routed-profile"
     )
 
     with caplog.at_level("INFO"):
@@ -154,7 +154,7 @@ def test_forum_general_location_uses_canonical_thread_profile_route(
     adapter = _adapter(authorized=True, extra={"require_mention": False})
     _prepare_profile(tmp_path, "general-profile")
     adapter.gateway_runner = SimpleNamespace(
-        _profile_name_for_source=lambda source: (
+        _profile_name_for_source=lambda source, *, adapter_profile=None: (
             "general-profile" if source.thread_id == "1" else None
         )
     )
@@ -174,7 +174,7 @@ def test_rejected_profile_route_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _adapter(authorized=True)
 
-    def _reject(_source):
+    def _reject(_source, *, adapter_profile=None):
         raise ProfileRouteRejected("synthetic-route")
 
     adapter.gateway_runner = SimpleNamespace(_profile_name_for_source=_reject)
@@ -188,7 +188,7 @@ def test_failed_profile_resolution_cannot_fall_back_to_default(tmp_path, monkeyp
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _adapter(authorized=True)
 
-    def _fail(_source):
+    def _fail(_source, *, adapter_profile=None):
         raise RuntimeError("synthetic routing failure")
 
     adapter.gateway_runner = SimpleNamespace(_profile_name_for_source=_fail)

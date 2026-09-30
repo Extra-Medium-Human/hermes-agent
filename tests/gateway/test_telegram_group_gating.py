@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.event import MessageType
+from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 import os
@@ -283,9 +284,10 @@ def test_observed_group_context_preserves_slash_command_text_for_dispatch():
     assert "observed Telegram group context" in attributed.channel_prompt
 
 
-def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(monkeypatch):
-    from gateway.run import GatewayRunner
-
+def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner = object.__new__(GatewayRunner)
     source = SessionSource(
         platform=Platform.TELEGRAM,
