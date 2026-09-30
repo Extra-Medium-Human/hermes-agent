@@ -32,3 +32,27 @@ export function selectRunnableBinary(opts: RunnableBinaryOptions): string | null
 
   return existing.find(opts.binaryRuns) || existing[0] || null
 }
+
+/** Marker on the error runGit rejects with when the git binary itself could not be spawned. */
+export const GIT_UNUSABLE = 'git-unusable'
+
+const SPAWN_FAILURE_REASONS: Record<string, string> = {
+  ENOENT: 'not found',
+  EACCES: 'permission denied',
+  EBADARCH: 'Bad CPU type in executable'
+}
+
+/** Return actionable copy when Git could not be spawned locally. */
+export function describeGitSpawnFailure(error: any, binaryPath: string): string | null {
+  const code = error?.code || (error?.errno === -86 ? 'EBADARCH' : '')
+  const reason = SPAWN_FAILURE_REASONS[code]
+
+  if (!reason) {
+    return null
+  }
+
+  return (
+    `Git on this computer cannot run (${binaryPath}: ${reason}). ` +
+    'Install a Git build for this machine (on macOS: `xcode-select --install`) and check again.'
+  )
+}

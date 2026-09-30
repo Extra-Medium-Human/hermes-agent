@@ -384,7 +384,13 @@ import {
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
-import { execGit, killTimedGitChildren, setNoConsoleGitRoots } from './no-console-git'
+import {
+  execGit,
+  killTimedGitChildren,
+  planNoConsoleGitSpawn,
+  setNoConsoleGitRoots,
+  windowsGitHost
+} from './no-console-git'
 import { registerNativeNotifications } from './notification-ipc'
 import { isExpectedOauthNavigationAbort } from './oauth-navigation'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
@@ -522,7 +528,7 @@ import {
   writeSecretStoragePolicy
 } from './secret-storage-policy'
 import { selectPathsDialogProperties } from './select-paths-dialog'
-import { selectRunnableBinary } from './select-runnable-binary'
+import { describeGitSpawnFailure, GIT_UNUSABLE, selectRunnableBinary } from './select-runnable-binary'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -568,8 +574,9 @@ import {
   type UpdateAuthority,
   verifyHandoffHelperBeforeQuit
 } from './update-authority'
-import { waitForUpdateClearance } from './update-gate'
+import { updateGateReason, waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict } from './update-marker'
+import { updateConnectionsBeforeLocal } from './update-order'
 import {
   resolveUpdaterMechanism,
   type UpdaterApplyResultWire,
@@ -584,7 +591,8 @@ import {
   resolveUpdateScriptHandoff,
   resolveVenvDir,
   sandboxFallbackFromEnv,
-  spawnUpdaterProcess
+  spawnUpdaterProcess,
+  userLauncherInstallRoot
 } from './updater-process'
 import { AppInstallerStrategy, createChannelAppInstallerStrategy } from './updater/app-installer'
 import { ChannelResolver, type ChannelTarget } from './updater/channel'
@@ -632,7 +640,7 @@ import {
   MIN_HEIGHT as WINDOW_MIN_HEIGHT,
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
-import { hiddenWindowsChildOptions } from './windows-child-options'
+import { hiddenWindowsChildOptions, windowsShellCommand } from './windows-child-options'
 import { buildPathExtCandidates, resolveVenvHermesCommand } from './windows-hermes-path'
 import {
   connectWindowsRemote,
