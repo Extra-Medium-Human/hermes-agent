@@ -11,7 +11,7 @@
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
-#   * The activated checkout's test environment (activates when needed)
+#   * The checkout's test environment (via scripts/run-in-hermes-env when needed)
 #
 # Usage:
 #   scripts/run_tests.sh                            # full suite
@@ -38,11 +38,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Locate python ───────────────────────────────────────────────────────────
-# The suite runs under the activated checkout's isolated test environment
-# (pm.testenv: `activate` builds it beside the checkout's install state, and CI
-# activates the same way). An inherited activation is re-checked against its
-# inputs (scripts/_activation.sh) and re-sourced when stale, so a branch switch
-# or lock edit never runs the suite against the previous dependency set.
+# The suite runs under the checkout's isolated test environment (pm.testenv),
+# and only there: unless the inherited environment is current for this
+# checkout, this script re-executes itself under scripts/run-in-hermes-env,
+# which syncs and applies it. That holds however the script is launched
+# (`scripts/run_tests.sh`, `bash scripts/run_tests.sh`, from CI or a shell), so
+# a branch switch or lock edit never runs the suite against the previous
+# dependency set.
 #
 # A candidate needs both test dependencies declared in the dev extra. A
 # release venv with pytest but no pytest-asyncio cannot collect or execute
@@ -78,6 +80,9 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
       VENV_PYTHON="$candidate/bin/python"
       break
     fi
+    echo "▶ environment missing or stale for $REPO_ROOT — re-running under run-in-hermes-env" >&2
+    export __HERMES_TESTS_REEXEC=1
+    exec "$SCRIPT_DIR/run-in-hermes-env" "$BASH" "${BASH_SOURCE[0]}" "$@"
   fi
   # Native Windows venv layout: python.exe and activate live under
   # Scripts/, and there is no bin/. Anyone running this script from
