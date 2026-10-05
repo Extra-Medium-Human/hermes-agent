@@ -105,6 +105,22 @@ describe('deriveUpdateStatus', () => {
     expect(view.line).toBe(en.updates.latestBody)
   })
 
+  it('does not claim the desktop is current while its running bundle is stale', () => {
+    const view = deriveUpdateStatus({
+      apply: IDLE_APPLY,
+      bundleOutOfSync: true,
+      checking: false,
+      status: { supported: true, behind: 0 },
+      target: 'client',
+      u: en.updates
+    })
+
+    expect(view.tone).toBe('error')
+    expect(view.updateAvailable).toBe(false)
+    expect(view.line).toBe(en.updates.bundleOutOfSync)
+    expect(view.error).toBe(en.updates.bundleOutOfSyncDesc)
+  })
+
   it('backend target says the backend is current, not "you"', () => {
     const view = deriveUpdateStatus({
       apply: IDLE_APPLY,

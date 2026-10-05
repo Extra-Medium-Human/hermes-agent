@@ -13,6 +13,7 @@ import {
   $backendUpdateApply,
   $backendUpdateChecking,
   $backendUpdateStatus,
+  $desktopVersion,
   $updateApply,
   $updateChecking,
   $updateStatus,
@@ -61,6 +62,7 @@ function retirementStatus(
  */
 interface UpdateStatusInput {
   apply: UpdateApplyState
+  bundleOutOfSync?: boolean
   checking: boolean
   status: DesktopUpdateStatus | null
   target: UpdateTarget
@@ -82,7 +84,14 @@ export function deriveUpdateStatus(input: UpdateStatusInput): UpdateStatusView {
   return ordinaryUpdateStatus(input)
 }
 
-function ordinaryUpdateStatus({ apply, checking, status, target, u }: UpdateStatusInput): UpdateStatusView {
+function ordinaryUpdateStatus({
+  apply,
+  bundleOutOfSync,
+  checking,
+  status,
+  target,
+  u
+}: UpdateStatusInput): UpdateStatusView {
   const behind = status?.behind ?? 0
   // behind is null when the exact count is unknowable (shallow clone): the
   // backend flags that case via updateAvailable instead of a number.
@@ -115,6 +124,17 @@ function ordinaryUpdateStatus({ apply, checking, status, target, u }: UpdateStat
       line: behind > 0 ? u.updateReady(behind) : u.updateReadyUnknown,
       supported,
       tone: 'available',
+      updateAvailable
+    }
+  }
+
+  if (target === 'client' && bundleOutOfSync) {
+    return {
+      applying,
+      error: u.bundleOutOfSyncDesc,
+      line: u.bundleOutOfSync,
+      supported,
+      tone: 'error',
       updateAvailable
     }
   }
@@ -276,9 +296,17 @@ export function UpdateStatusCard({
   const status = useStore(isBackend ? $backendUpdateStatus : $updateStatus)
   const checking = useStore(isBackend ? $backendUpdateChecking : $updateChecking)
   const apply = useStore(isBackend ? $backendUpdateApply : $updateApply)
+  const desktopVersion = useStore($desktopVersion)
   const [justChecked, setJustChecked] = useState<boolean>(false)
 
-  const view = deriveUpdateStatus({ apply, checking, status, target, u })
+  const view = deriveUpdateStatus({
+    apply,
+    bundleOutOfSync: !isBackend && Boolean(desktopVersion?.bundleOutOfSync),
+    checking,
+    status,
+    target,
+    u
+  })
 
   const handleCheck = async (): Promise<void> => {
     setJustChecked(false)
