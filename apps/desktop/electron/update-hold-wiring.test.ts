@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
 
-import { test } from 'vitest'
+import { afterEach, test } from 'vitest'
 
 import type { UpdateHoldWire } from './update-hold-types'
-import { registerUpdateHoldIpc } from './update-hold-wiring'
+import { createOwnedUpdateGateDeps, registerUpdateHoldIpc } from './update-hold-wiring'
+import { markerPath } from './update-marker'
+import { resetHoldStateForTests } from './update-marker-gate'
+import { cleanupMarkerFixtures, deadPid, minutesAgo } from './update-marker.test-helpers'
+import { cleanupFakeCheckouts, fakeHelperCheckout } from './updater/marker-helper.test-helpers'
 
 const HOLD: UpdateHoldWire = {
   holdId: 'hold-1',
@@ -13,6 +19,12 @@ const HOLD: UpdateHoldWire = {
   checkedAt: 2,
   logPath: '/logs/desktop.log'
 }
+
+afterEach(() => {
+  resetHoldStateForTests()
+  cleanupMarkerFixtures()
+  cleanupFakeCheckouts()
+})
 
 function register(state: { phase: string; updateHold: UpdateHoldWire | null }) {
   const handlers = new Map<string, (event: any, ...args: any[]) => Promise<any>>()
@@ -57,3 +69,28 @@ test('a non-primary window cannot quit from the update-hold screen', async () =>
   assert.deepEqual(await quit({ sender: primary }), { ok: true })
   assert.equal(quits(), 1)
 })
+
+test.skipIf(process.platform === 'win32')(
+  'the final main boot adapter cannot bypass a dead marker whose descendant still holds the checkout',
+  async () => {
+    const mainSource = fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf8')
+
+    assert.match(mainSource, /return createOwnedUpdateGateDeps\(/)
+    assert.doesNotMatch(mainSource, /readLiveUpdateMarker/)
+
+    const { root, home } = fakeHelperCheckout()
+    fs.writeFileSync(markerPath(home), `${await deadPid()}\n${minutesAgo(1)}\nct:1.000\n`)
+    fs.writeFileSync(path.join(home, 'helper-verdict'), 'held')
+
+    const deps = createOwnedUpdateGateDeps({
+      hermesHome: home,
+      isWindows: false,
+      log: () => {},
+      updateRoot: () => root,
+      isUpdateInFlight: () => false,
+      isHandoffActive: () => false
+    })
+
+    assert.equal(await deps.hasLiveMarker(), true, 'the helper-owned descendant hold keeps main boot closed')
+  }
+)

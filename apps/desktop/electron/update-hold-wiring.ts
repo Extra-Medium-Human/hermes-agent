@@ -36,6 +36,11 @@ export interface MarkerGateHost {
   updateRoot: () => string
 }
 
+export interface OwnedUpdateGateHost extends MarkerGateHost {
+  isUpdateInFlight: () => boolean
+  isHandoffActive: () => boolean
+}
+
 export function markerGateProbe(host: MarkerGateHost, { onLiveMarker, onHeld, onOverride }: MarkerGateCallbacks = {}) {
   // One creation-time probe per pid for this wait: on Windows each probe is a
   // powershell spawn and the gate polls every second.
@@ -64,6 +69,18 @@ export function markerGateProbe(host: MarkerGateHost, { onLiveMarker, onHeld, on
         isWindows: host.isWindows
       })
   })
+}
+
+/** The complete ownership gate used by main.ts for every local backend start. */
+export function createOwnedUpdateGateDeps(
+  host: OwnedUpdateGateHost,
+  callbacks: MarkerGateCallbacks = {}
+): UpdateGateDeps {
+  return {
+    hasLiveMarker: markerGateProbe(host, callbacks),
+    isUpdateInFlight: host.isUpdateInFlight,
+    isHandoffActive: host.isHandoffActive
+  }
 }
 
 export interface UpdateHoldScreenHost {

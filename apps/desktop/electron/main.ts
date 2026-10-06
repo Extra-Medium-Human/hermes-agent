@@ -605,7 +605,15 @@ import {
   verifyHandoffHelperBeforeQuit
 } from './update-authority'
 import { waitForUpdateClearance } from './update-gate'
-import { readLiveUpdateMarker, updateHandoffConflict } from './update-marker'
+import {
+  createOwnedUpdateGateDeps,
+  createUpdateHoldScreen,
+  type MarkerGateCallbacks,
+  registerUpdateHoldIpc,
+  waitForPoolUpdateClearance
+} from './update-hold-wiring'
+import { updateHandoffConflict } from './update-marker'
+import { holdTicker } from './update-marker-gate'
 import { updateConnectionsBeforeLocal } from './update-order'
 import {
   resolveUpdaterMechanism,
@@ -2255,6 +2263,7 @@ let bootProgressState = {
   retryable: false,
   running: false,
   statusCode: null,
+  updateHold: null,
   timestamp: Date.now()
 }
 
@@ -3007,50 +3016,18 @@ const UPDATE_HANDOFF_DWELL_MS = 2500
 // The hand-off state closes the later Windows `cmd start` wrapper gap: the
 // wrapper exits 0 before the real PowerShell script claims the marker, and
 // `finally` clears updateInFlight immediately after the hand-off is accepted.
-function failedReceiptFinishesLegacyMarker(): boolean {
-  let markerText = ''
-
-  try {
-    markerText = fs.readFileSync(path.join(HERMES_HOME, '.hermes-update-in-progress'), 'utf8')
-  } catch {
-    return false
-  }
-
-  // A v2 owner/delegate identity is authoritative. A previous failed receipt
-  // must not release a retry that is live under the replacement hold protocol.
-  const lines = markerText.trimEnd().split(/\r?\n/)
-
-  if (lines.some(line => line.startsWith('ct:') || line.startsWith('delegate:'))) {
-    return false
-  }
-
-  const startedAt = Number(lines[1])
-  const receipt = readLatestSyncReceipt()
-  const finishedAt = Date.parse(String(receipt?.finished_at ?? '')) / 1000
-
-  // The marker records whole seconds. A receipt in the same second is
-  // ambiguous, so only a later terminal failure proves this legacy run ended.
-  return receipt?.outcome === 'failed' && Number.isFinite(startedAt) && finishedAt >= startedAt + 1
-}
-
-/**
- * Adapter across the legacy synchronous marker reader and origin/main's
- * asynchronous owner-identity judge. The old failed-receipt escape applies
- * only to an identity-free v1 marker; v2 ownership remains authoritative.
- */
-function liveMarkerBlocksStart(): any {
-  const inspected: any = readLiveUpdateMarker(HERMES_HOME)
-  const blocks = (marker: unknown): boolean => Boolean(marker) && !failedReceiptFinishesLegacyMarker()
-
-  return inspected && typeof inspected.then === 'function' ? inspected.then(blocks) : blocks(inspected)
-}
-
-function updateGateDeps() {
-  return {
-    hasLiveMarker: liveMarkerBlocksStart,
-    isUpdateInFlight: () => updateInFlight,
-    isHandoffActive: () => isQuittingForHandoff
-  }
+function updateGateDeps(callbacks: MarkerGateCallbacks = {}) {
+  return createOwnedUpdateGateDeps(
+    {
+      hermesHome: HERMES_HOME,
+      isWindows: IS_WINDOWS,
+      log: rememberLog,
+      updateRoot: resolveUpdateRoot,
+      isUpdateInFlight: () => updateInFlight,
+      isHandoffActive: () => isQuittingForHandoff
+    },
+    callbacks
+  )
 }
 
 // One-shot guard for the automatic bundle-swap relaunch below: the relaunched
@@ -3111,24 +3088,40 @@ function relaunchIntoSwappedBundle() {
 // rather than a frozen splash. Returns true if it parked at all.
 async function waitForUpdateToFinish() {
   let announced = false
-
-  const outcome = await waitForUpdateClearance(updateGateDeps(), {
-    signal: localBackendLifecycle.signal,
-    onWaitTick: async reason => {
-      if (!announced) {
-        announced = true
-        rememberLog(`[updates] update in progress (${reason}); deferring backend start until it finishes`)
-      }
-
-      await advanceBootProgress(
-        'backend.update-wait',
-        'An update is finishing — Hermes will start automatically when it completes…',
-        12
-      )
-    },
-    pollMs: UPDATE_WAIT_POLL_MS,
-    timeoutMs: UPDATE_WAIT_TIMEOUT_MS
+  const hold = holdTicker({
+    show: state => updateHoldScreen.show(state),
+    clear: () => updateHoldScreen.clear()
   })
+  let outcome
+
+  try {
+    outcome = await waitForUpdateClearance(
+      updateGateDeps({
+        onHeld: state => hold.onHeld(state),
+        onOverride: () => updateHoldScreen.clear()
+      }),
+      {
+        signal: localBackendLifecycle.signal,
+        onWaitTick: async reason => {
+          if (!announced) {
+            announced = true
+            rememberLog(`[updates] update in progress (${reason}); deferring backend start until it finishes`)
+          }
+
+          await advanceBootProgress(
+            'backend.update-wait',
+            'An update is finishing — Hermes will start automatically when it completes…',
+            12
+          )
+          hold.tick(reason)
+        },
+        pollMs: UPDATE_WAIT_POLL_MS,
+        timeoutMs: UPDATE_WAIT_TIMEOUT_MS
+      }
+    )
+  } finally {
+    updateHoldScreen.clear()
+  }
 
   // The detached hand-off script (scripts/desktop-update/windows.ps1) runs hidden;
   // its result file is the ONLY way the user learns a detached update
@@ -3762,6 +3755,13 @@ function resolveUpdateRoot() {
 
   return candidates.find(isGitCheckout) || candidates[0] || ACTIVE_HERMES_ROOT
 }
+
+const updateHoldScreen = createUpdateHoldScreen({
+  hermesHome: HERMES_HOME,
+  log: rememberLog,
+  bootHold: () => bootProgressState.updateHold ?? null,
+  updateBootProgress
+})
 
 function runGit(args, options: any = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -12873,24 +12873,21 @@ async function runPoolBackendStart(
   // Same update mutual exclusion as the primary window's waitForLocalStart
   // (#73822): pool backends spawn from the same venv, so an ungated respawn
   // during applyUpdates' critical section starts a backend on the runtime
-  // being replaced. No boot-progress UI here — pool backends boot
-  // silently for background profiles — so we only log while parked.
-  {
-    let poolAnnounced = false
-
-    await waitForUpdateClearance(updateGateDeps(), {
-      signal: localBackendLifecycle.signal,
-      isCancelled: (): boolean => backendPool.get(poolKey) !== entry,
-      onWaitTick: reason => {
-        if (!poolAnnounced) {
-          poolAnnounced = true
-          rememberLog(`[updates] update in progress (${reason}); deferring pool backend start for profile "${profile}"`)
-        }
-      },
-      pollMs: UPDATE_WAIT_POLL_MS,
-      timeoutMs: UPDATE_WAIT_TIMEOUT_MS
-    })
-  }
+  // being replaced. Pool starts have no phase of their own, but a persistent
+  // ownership hold is published on the primary boot surface so the user can
+  // recheck, quit, or explicitly confirm Start anyway.
+  await waitForPoolUpdateClearance({
+    profile,
+    poolKey,
+    gateDeps: callbacks => updateGateDeps(callbacks),
+    signal: localBackendLifecycle.signal,
+    isCancelled: (): boolean => backendPool.get(poolKey) !== entry,
+    log: rememberLog,
+    showHold: (state, owner) => updateHoldScreen.show(state, owner),
+    clearHold: owner => updateHoldScreen.clear(owner),
+    pollMs: UPDATE_WAIT_POLL_MS,
+    timeoutMs: UPDATE_WAIT_TIMEOUT_MS
+  })
 
   profileDeletionGate.assertCanStart(profile)
 
@@ -16678,7 +16675,15 @@ ipcMain.handle('hermes:bootstrap:cancel', async () => {
 
   return { ok: false, cancelled: false }
 })
-ipcMain.handle('hermes:boot-progress:get', async () => bootProgressState)
+registerUpdateHoldIpc(ipcMain, {
+  isPrimaryBootSender: event =>
+    Boolean(mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents),
+  bootProgress: () => bootProgressState,
+  currentHold: updateHoldScreen.current,
+  log: rememberLog,
+  flushLog: flushDesktopLogBufferSync,
+  quit: () => app.quit()
+})
 ipcMain.handle('hermes:bootstrap:get', async () => getBootstrapState())
 ipcMain.handle('hermes:local-backend:probe', async () => {
   // Resolution only. ensureRuntime/runBootstrap must not start from a hover
@@ -19377,6 +19382,7 @@ function resolveHermesVersion(scope: { connectionId?: string; profile?: string }
 // apps/desktop/, and warn when the running renderer is provably behind.
 // Fail-quiet: dev runs (no stamp), non-git builds, and shallow-clone gaps all
 // report in-sync rather than risk a false "your install is torn" warning.
+const rendererSkewUpdateGate = updateGateDeps()
 const checkRendererSkew = createBundleSkewChecker(
   INSTALL_STAMP,
   (args, options) => execGit(resolveGitBinary(), args, options),
@@ -19386,7 +19392,7 @@ const checkRendererSkew = createBundleSkewChecker(
         return true
       }
 
-      return liveMarkerBlocksStart()
+      return rendererSkewUpdateGate.hasLiveMarker()
     }
   }
 )
