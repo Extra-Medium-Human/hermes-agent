@@ -604,7 +604,7 @@ import {
   type UpdateAuthority,
   verifyHandoffHelperBeforeQuit
 } from './update-authority'
-import { updateGateReason, waitForUpdateClearance } from './update-gate'
+import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict } from './update-marker'
 import { updateConnectionsBeforeLocal } from './update-order'
 import {
@@ -3007,20 +3007,49 @@ const UPDATE_HANDOFF_DWELL_MS = 2500
 // The hand-off state closes the later Windows `cmd start` wrapper gap: the
 // wrapper exits 0 before the real PowerShell script claims the marker, and
 // `finally` clears updateInFlight immediately after the hand-off is accepted.
+function failedReceiptFinishesLegacyMarker(): boolean {
+  let markerText = ''
+
+  try {
+    markerText = fs.readFileSync(path.join(HERMES_HOME, '.hermes-update-in-progress'), 'utf8')
+  } catch {
+    return false
+  }
+
+  // A v2 owner/delegate identity is authoritative. A previous failed receipt
+  // must not release a retry that is live under the replacement hold protocol.
+  const lines = markerText.trimEnd().split(/\r?\n/)
+
+  if (lines.some(line => line.startsWith('ct:') || line.startsWith('delegate:'))) {
+    return false
+  }
+
+  const startedAt = Number(lines[1])
+  const receipt = readLatestSyncReceipt()
+  const finishedAt = Date.parse(String(receipt?.finished_at ?? '')) / 1000
+
+  // The marker records whole seconds. A receipt in the same second is
+  // ambiguous, so only a later terminal failure proves this legacy run ended.
+  return receipt?.outcome === 'failed' && Number.isFinite(startedAt) && finishedAt >= startedAt + 1
+}
+
+/**
+ * Adapter across the legacy synchronous marker reader and origin/main's
+ * asynchronous owner-identity judge. The old failed-receipt escape applies
+ * only to an identity-free v1 marker; v2 ownership remains authoritative.
+ */
+function liveMarkerBlocksStart(): any {
+  const inspected: any = readLiveUpdateMarker(HERMES_HOME)
+  const blocks = (marker: unknown): boolean => Boolean(marker) && !failedReceiptFinishesLegacyMarker()
+
+  return inspected && typeof inspected.then === 'function' ? inspected.then(blocks) : blocks(inspected)
+}
+
 function updateGateDeps() {
   return {
-    hasLiveMarker: () => Boolean(readLiveUpdateMarker(HERMES_HOME)),
+    hasLiveMarker: liveMarkerBlocksStart,
     isUpdateInFlight: () => updateInFlight,
-    isHandoffActive: () => isQuittingForHandoff,
-    // The latest receipt is cross-process truth: a `hermes update` that failed
-    // records outcome "failed" even when its marker write/release raced a
-    // crash (#122206). Only a TERMINAL failure counts — "running" must keep
-    // parking, and "partial" kept the install usable.
-    hasFailedReceipt: () => {
-      const receipt = readLatestSyncReceipt()
-
-      return receipt?.outcome === 'failed'
-    }
+    isHandoffActive: () => isQuittingForHandoff
   }
 }
 
@@ -3082,27 +3111,9 @@ function relaunchIntoSwappedBundle() {
 // rather than a frozen splash. Returns true if it parked at all.
 async function waitForUpdateToFinish() {
   let announced = false
-  let parkedOnFailedReceipt = false
 
   const outcome = await waitForUpdateClearance(updateGateDeps(), {
     signal: localBackendLifecycle.signal,
-    abandonOn: reason => {
-      // The update that owns the gate already recorded a terminal failure
-      // (#122206): parking the full 20-minute budget on a receipt that says
-      // "failed" strands the window behind a dead updater (486 silent polls
-      // measured). Stop waiting; the failure dialog below carries the
-      // recovery guidance and the backend's own launch path finishes only
-      // what is safely retryable, bounded by venv_sync's completion-retry
-      // backoff.
-      if (reason === 'failed-receipt') {
-        parkedOnFailedReceipt = true
-        rememberLog('[updates] latest update receipt records a failure; not parking the boot on it')
-
-        return true
-      }
-
-      return false
-    },
     onWaitTick: async reason => {
       if (!announced) {
         announced = true
@@ -3183,11 +3194,6 @@ async function waitForUpdateToFinish() {
 
   if (outcome === 'timeout') {
     rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
-  } else if (parkedOnFailedReceipt) {
-    // The gate closed on a terminal failure, not a live update: no swap to
-    // relaunch into (the update never succeeded), so boot the current build
-    // and let the failure dialog above carry the recovery guidance.
-    rememberLog('[updates] proceeding with backend start despite the failed update receipt')
   } else if (relaunchIntoSwappedBundle()) {
     await advanceBootProgress('backend.update-restart', 'Restarting Hermes to load the updated app…', 14)
     // Park while the scheduled exit lands so this stale build never starts a
@@ -5429,7 +5435,7 @@ async function applyUpdatesPosixHandoff(opts: any) {
     return { ok: true, current: true, message, authority }
   }
 
-  const handoffConflict = updateHandoffConflict(HERMES_HOME)
+  const handoffConflict = await updateHandoffConflict(HERMES_HOME)
 
   if (handoffConflict) {
     rememberLog(`[updates] refusing posix hand-off: ${handoffConflict.message}`)
@@ -19374,7 +19380,15 @@ function resolveHermesVersion(scope: { connectionId?: string; profile?: string }
 const checkRendererSkew = createBundleSkewChecker(
   INSTALL_STAMP,
   (args, options) => execGit(resolveGitBinary(), args, options),
-  { isUpdating: () => updateGateReason(updateGateDeps()) !== null }
+  {
+    isUpdating: () => {
+      if (updateInFlight || isQuittingForHandoff) {
+        return true
+      }
+
+      return liveMarkerBlocksStart()
+    }
+  }
 )
 
 async function detectRendererSkew() {
@@ -20346,10 +20360,12 @@ app.on('before-quit', event => {
       managedUpdateQuitWait = waitForManagedUpdateOperations(() => [
         ...managedConnectionUpdates.values(),
         ...managedConnectionRecoveries.values()
-      ]).finally(() => {
-        managedUpdateQuitWaitDone = true
-        app.quit()
-      })
+      ])
+        .then(() => undefined)
+        .finally(() => {
+          managedUpdateQuitWaitDone = true
+          app.quit()
+        })
     }
 
     return
