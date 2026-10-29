@@ -23,6 +23,7 @@ import { $connectionsRegistry, refreshConnectionsRegistry } from '@/store/connec
 import { reconnectGateway } from '@/store/gateway-reconnect'
 import { dismissNotification, notify } from '@/store/notifications'
 import { $connection } from '@/store/session'
+import { checkUpstreamStatus } from '@/store/upstream-status'
 import type { BackendUpdateCheckResponse, UpdateReceiptSummary } from '@/types/hermes'
 
 /** Keyed per retired-channel revision: a new retirement (or a revision bump on
@@ -1259,6 +1260,7 @@ function runPassiveChecks(): void {
   persistString(FOCUS_RECHECK_KEY, String(Date.now()))
   void checkUpdates()
   void checkBackendUpdates()
+  void checkUpstreamStatus()
 }
 
 /** Wire up background polling + progress streaming. Idempotent. */

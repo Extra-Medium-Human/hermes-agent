@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopUpdateStatus, DesktopVersionInfo, HermesConnection } from '@/global'
 import { en } from '@/i18n/en'
+import { checkLocalBackendStatus } from '@/store/local-backend-status'
 import type * as SessionStore from '@/store/session'
 import { $connection } from '@/store/session'
 import {
@@ -15,8 +16,21 @@ import {
   startActiveUpdate,
   type UpdateApplyState
 } from '@/store/updates'
+import { $upstreamStatus, checkUpstreamStatus } from '@/store/upstream-status'
 
 import { AboutSettings } from './about-settings'
+
+vi.mock('@/store/local-backend-status', async () => {
+  const { atom } = await import('nanostores')
+
+  return { $localBackendStatus: atom(null), checkLocalBackendStatus: vi.fn().mockResolvedValue(null) }
+})
+
+vi.mock('@/store/upstream-status', async () => {
+  const { atom } = await import('nanostores')
+
+  return { $upstreamStatus: atom(null), $upstreamChecking: atom(false), checkUpstreamStatus: vi.fn().mockResolvedValue(null) }
+})
 
 vi.mock('@/store/session', async (importOriginal): Promise<Record<string, unknown>> => {
   const actual = await importOriginal<typeof SessionStore>()
@@ -80,8 +94,9 @@ describe('AboutSettings', (): void => {
       hermesRoot: '/test/hermes',
       installId: 'test-install'
     })
-    $updateStatus.set({ supported: true, behind: 0 })
-    $backendUpdateStatus.set({ supported: true, behind: 0 })
+    $updateStatus.set({ supported: true, behind: 0, updateAvailable: false })
+    $backendUpdateStatus.set({ supported: true, behind: 0, updateAvailable: false })
+    $upstreamStatus.set(null)
   })
 
   afterEach((): void => {
@@ -110,6 +125,32 @@ describe('AboutSettings', (): void => {
 
     expect(refreshDesktopVersion).toHaveBeenCalledTimes(3)
     expect(checkBackendUpdates).toHaveBeenCalledTimes(2)
+  })
+
+  it('shows independent upstream, installed build, fork and local backend evidence', async () => {
+    $updateStatus.set({ supported: true, branch: 'codex/hermes-live-current', currentSha: 'a'.repeat(40), behind: 0, updateAvailable: false })
+    $upstreamStatus.set({
+      state: 'upstream-not-integrated', head: 'a'.repeat(40), upstream_tip: 'b'.repeat(40),
+      checked_at: Date.now(), branch: 'main', remote_url: 'https://github.com/NousResearch/hermes-agent.git',
+      message: 'Changes not integrated'
+    })
+    render(<AboutSettings />)
+    expect(screen.getByText('Fork update')).toBeTruthy()
+    expect(screen.getByText('Nous upstream')).toBeTruthy()
+    expect(screen.getByText('Changes not integrated')).toBeTruthy()
+    expect(screen.getByText('Installed Desktop')).toBeTruthy()
+    expect(screen.getByText('Connected backend')).toBeTruthy()
+    expect(checkLocalBackendStatus).toHaveBeenCalledTimes(1)
+    expect(checkUpstreamStatus).toHaveBeenCalled()
+  })
+
+  it('keeps upstream status independent when fork authority fails and forces both checks', async () => {
+    $updateStatus.set({ supported: true, error: 'AUTHORITY_UNVERIFIED', message: 'fork failed' })
+    render(<AboutSettings />)
+    expect(screen.getAllByText('Could not verify').length).toBeGreaterThan(0)
+    fireEvent.click(screen.getAllByRole('button', { name: en.updates.checkNow })[0])
+    await waitFor(() => expect(checkUpstreamStatus).toHaveBeenCalledWith({ force: true }))
+    expect(checkUpdates).toHaveBeenCalledWith({ force: true })
   })
 
   it('shows the fixed package channel with no selector', (): void => {

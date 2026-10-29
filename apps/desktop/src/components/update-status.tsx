@@ -139,10 +139,10 @@ function ordinaryUpdateStatus({
     }
   }
 
-  if (status) {
+  if (status?.behind === 0 && status.updateAvailable === false) {
     return {
       applying,
-      line: target === 'backend' ? u.latestBodyBackend : u.latestBody,
+      line: target === 'backend' ? u.latestBodyBackend : 'Configured fork branch is current.',
       supported,
       tone: 'idle',
       updateAvailable
@@ -284,9 +284,13 @@ function UpdateActions({ target, u, view }: UpdateActionsProps): ReactElement | 
  * "Update now" opens it and starts the install there.
  */
 export function UpdateStatusCard({
+  label,
+  onCheck,
   showReleaseNotes = true,
   target
 }: {
+  label?: string
+  onCheck?: () => void
   showReleaseNotes?: boolean
   target: UpdateTarget
 }): ReactElement {
@@ -310,6 +314,7 @@ export function UpdateStatusCard({
 
   const handleCheck = async (): Promise<void> => {
     setJustChecked(false)
+    onCheck?.()
     const next = await (isBackend ? checkBackendUpdates({ force: true }) : checkUpdates({ force: true }))
     setJustChecked(Boolean(next))
   }
@@ -326,11 +331,14 @@ export function UpdateStatusCard({
       <div className="flex items-start gap-2">
         {view.tone === 'available' ? (
           <Codicon className="mt-0.5 size-4 shrink-0 text-primary" name="cloud-download" size="1rem" />
-        ) : view.tone === 'error' || view.tone === 'unsupported' ? null : (
+        ) : view.tone === 'error' || view.tone === 'unsupported' ||
+          !(status?.behind === 0 && status.updateAvailable === false) ? null : (
           <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
         )}
         <div className="min-w-0">
+          {label && <p className="mb-1 text-xs font-semibold text-muted-foreground">{label}</p>}
           <p className="font-medium">{view.line}</p>
+          {status?.branch && <p className="mt-1 text-xs text-muted-foreground">{status.branch} · {status.currentSha?.slice(0, 12) ?? 'SHA unverified'}</p>}
           {view.error && <p className="mt-1 text-xs text-muted-foreground">{view.error}</p>}
           {view.tone !== 'unsupported' && (
             <p className="mt-1 text-xs text-muted-foreground">

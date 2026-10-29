@@ -656,6 +656,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     summary: () => ipcRenderer.invoke('hermes:uninstall:summary'),
     run: mode => ipcRenderer.invoke('hermes:uninstall:run', { mode })
   },
+  upstream: {
+    check: opts => ipcRenderer.invoke('hermes:upstream:check', opts)
+  },
   updates: {
     check: opts => ipcRenderer.invoke('hermes:updates:check', opts),
     apply: opts => ipcRenderer.invoke('hermes:updates:apply', opts),

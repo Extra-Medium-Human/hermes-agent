@@ -605,6 +605,7 @@ import {
   verifyHandoffHelperBeforeQuit
 } from './update-authority'
 import { waitForUpdateClearance } from './update-gate'
+import { createUpstreamStatusChecker } from './upstream-status'
 import {
   createOwnedUpdateGateDeps,
   createUpdateHoldScreen,
@@ -3957,14 +3958,9 @@ function emitUpdateProgress(payload) {
   }
 }
 
-// Passive checks never touch git's network side. Every client used to `git
-// fetch` twice per half hour; across the install base that was tens of
-// millions of pack negotiations a day against one repo (GitHub flagged it).
-// The REST API answers the same question in one 40-byte response, so the
-// check is API-first with a 24h on-disk cache keyed on local HEAD (applying an
-// update changes HEAD, which busts the cache immediately). `git fetch` runs only
-// inside applyUpdates. `force` (menu item, Settings "Check now") skips the
-// cache; the renderer's background poller never passes it.
+// The configured fork authority check calls update_authority check, which
+// fetches that fork's tracking ref. There is no API or disk cache; force is
+// ignored here. Nous upstream has its own bounded passive cache below.
 async function checkUpdates({ force: _force = false }: { force?: boolean } = {}) {
   const updateRoot = resolveUpdateRoot()
   const authorityResult = configuredUpdateAuthority(updateRoot)
@@ -4035,6 +4031,18 @@ async function checkUpdates({ force: _force = false }: { force?: boolean } = {})
     fetchedAt: Date.now()
   }
 }
+
+const upstreamChecker = createUpstreamStatusChecker(async updateRoot =>
+  runCapturedProcess(await updateAuthorityPython(updateRoot),
+    ['-m', 'hermes_cli.upstream_status', '--repo', updateRoot], {
+      cwd: updateRoot,
+      env: {
+        PYTHONPATH: [updateRoot, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+        GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never'
+      },
+      timeoutMs: 30_000
+    })
+)
 
 let updateInFlight = false
 
@@ -19342,6 +19350,10 @@ ipcMain.handle(
       message: error?.message || String(error),
       fetchedAt: Date.now()
     }))
+)
+
+ipcMain.handle('hermes:upstream:check', (_event, opts?: { force?: boolean }) =>
+  upstreamChecker.check(resolveUpdateRoot(), opts?.force === true)
 )
 
 ipcMain.handle('hermes:updates:apply', async (_event, payload) =>

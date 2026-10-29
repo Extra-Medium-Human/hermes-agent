@@ -98,11 +98,11 @@ describe('deriveUpdateStatus', () => {
   })
 
   it('up to date: idle tone with the latest-version line', () => {
-    const view = derive({ supported: true, behind: 0 })
+    const view = derive({ supported: true, behind: 0, updateAvailable: false })
 
     expect(view.tone).toBe('idle')
     expect(view.updateAvailable).toBe(false)
-    expect(view.line).toBe(en.updates.latestBody)
+    expect(view.line).toBe('Configured fork branch is current.')
   })
 
   it('does not claim the desktop is current while its running bundle is stale', () => {
@@ -110,7 +110,7 @@ describe('deriveUpdateStatus', () => {
       apply: IDLE_APPLY,
       bundleOutOfSync: true,
       checking: false,
-      status: { supported: true, behind: 0 },
+      status: { supported: true, behind: 0, updateAvailable: false },
       target: 'client',
       u: en.updates
     })
@@ -125,7 +125,7 @@ describe('deriveUpdateStatus', () => {
     const view = deriveUpdateStatus({
       apply: IDLE_APPLY,
       checking: false,
-      status: { supported: true, behind: 0 },
+      status: { supported: true, behind: 0, updateAvailable: false },
       target: 'backend',
       u: en.updates
     })

@@ -1,0 +1,115 @@
+export interface UpstreamStatus {
+  state: 'current' | 'upstream-not-integrated' | 'unverified'
+  head: string | null
+  upstream_tip: string | null
+  checked_at: number
+  branch: 'main'
+  remote_url: 'https://github.com/NousResearch/hermes-agent.git'
+  message: string
+}
+
+const REMOTE_URL = 'https://github.com/NousResearch/hermes-agent.git'
+const sha = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)
+
+function unverified(): UpstreamStatus {
+  return {
+    state: 'unverified',
+    head: null,
+    upstream_tip: null,
+    checked_at: Date.now(),
+    branch: 'main',
+    remote_url: REMOTE_URL,
+    message: 'Could not verify Nous upstream status.'
+  }
+}
+
+export function parseUpstreamStatus(code: number, stdout: string): UpstreamStatus {
+  if (code !== 0) {
+    return unverified()
+  }
+
+  try {
+    const value: unknown = JSON.parse(stdout)
+
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return unverified()
+    }
+    const row = value as Record<string, unknown>
+
+    if (
+      !['current', 'upstream-not-integrated', 'unverified'].includes(String(row.state)) ||
+      row.branch !== 'main' ||
+      row.remote_url !== REMOTE_URL ||
+      typeof row.checked_at !== 'number' ||
+      !Number.isSafeInteger(row.checked_at) ||
+      row.checked_at <= 0 ||
+      typeof row.message !== 'string' ||
+      !row.message.trim() ||
+      (row.head !== null && !sha(row.head)) ||
+      (row.upstream_tip !== null && !sha(row.upstream_tip)) ||
+      (row.state !== 'unverified' && (!sha(row.head) || !sha(row.upstream_tip)))
+    ) {
+      return unverified()
+    }
+
+    return row as unknown as UpstreamStatus
+  } catch {
+    return unverified()
+  }
+}
+
+/** A passive flight never satisfies an explicit refresh made while it is running. */
+export function createUpstreamStatusChecker(
+  probe: (root: string) => Promise<{ code: number; stdout: string }>,
+  ttlMs = 30 * 60_000
+) {
+  const entries = new Map<string, { result?: UpstreamStatus; expires?: number; flight?: Promise<UpstreamStatus> }>()
+
+  return {
+    check(root: string, force = false): Promise<UpstreamStatus> {
+      let entry = entries.get(root)
+
+      if (!entry) {
+        entry = {}
+        entries.set(root, entry)
+      }
+
+      const slot = entry
+
+      if (!force && slot.flight) {
+        return slot.flight
+      }
+
+      if (!force && slot.result && Date.now() < (slot.expires ?? 0)) {
+        return Promise.resolve(slot.result)
+      }
+      const predecessor = force ? slot.flight : undefined
+
+      const flight = (async () => {
+        if (predecessor) {
+          await predecessor
+        }
+        let result: UpstreamStatus
+
+        try {
+          const output = await probe(root)
+          result = parseUpstreamStatus(output.code, output.stdout)
+        } catch {
+          result = unverified()
+        }
+
+        if (slot.flight === flight) {
+          slot.result = result
+          slot.expires = Date.now() + ttlMs
+          slot.flight = undefined
+        }
+
+        return result
+      })()
+
+      slot.flight = flight
+
+      return flight
+    }
+  }
+}

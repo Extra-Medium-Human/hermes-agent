@@ -641,6 +641,9 @@ declare global {
         ackPendingRun?: (sent: boolean) => Promise<void>
         onPendingRun?: (callback: () => void) => () => void
       }
+      upstream: {
+        check: (opts?: { force?: boolean }) => Promise<NousUpstreamStatus>
+      }
       desktopMetrics?: {
         /** Mirror this window's focused profile and its opt-in; false deletes that profile's pending crashes. */
         setEnabled?: (on: boolean, profile: string) => Promise<void>
@@ -837,6 +840,17 @@ export interface DesktopUpdateCommit {
   summary: string
   author: string
   at: number
+}
+
+/** Independent upstream comparison; never an update authority or apply target. */
+export interface NousUpstreamStatus {
+  state: 'current' | 'upstream-not-integrated' | 'unverified'
+  head: string | null
+  upstream_tip: string | null
+  checked_at: number
+  branch: 'main'
+  remote_url: 'https://github.com/NousResearch/hermes-agent.git'
+  message: string
 }
 
 export type UpdaterMechanismClient =
