@@ -2,10 +2,15 @@ import { atom } from 'nanostores'
 
 import type { DesktopUpdateStatus } from '@/global'
 import { checkHermesUpdate } from '@/hermes'
+import { $connection } from '@/store/session'
 
 export const $localBackendStatus = atom<DesktopUpdateStatus | null>(null)
+let latestRequest = 0
 
 export async function checkLocalBackendStatus(force = false): Promise<DesktopUpdateStatus> {
+  const request = ++latestRequest
+  const connection = $connection.get()
+  $localBackendStatus.set(null)
   let status: DesktopUpdateStatus
 
   try {
@@ -33,7 +38,9 @@ export async function checkLocalBackendStatus(force = false): Promise<DesktopUpd
     }
   }
 
-  $localBackendStatus.set(status)
+  if (request === latestRequest && $connection.get() === connection) {
+    $localBackendStatus.set(status)
+  }
 
   return status
 }

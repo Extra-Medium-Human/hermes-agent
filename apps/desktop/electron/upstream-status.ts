@@ -34,6 +34,7 @@ export function parseUpstreamStatus(code: number, stdout: string): UpstreamStatu
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return unverified()
     }
+
     const row = value as Record<string, unknown>
 
     if (
@@ -83,12 +84,17 @@ export function createUpstreamStatusChecker(
       if (!force && slot.result && Date.now() < (slot.expires ?? 0)) {
         return Promise.resolve(slot.result)
       }
+
       const predecessor = force ? slot.flight : undefined
 
       const flight = (async () => {
+        // Publish the flight before a synchronously throwing launcher can settle it.
+        await Promise.resolve()
+
         if (predecessor) {
           await predecessor
         }
+
         let result: UpstreamStatus
 
         try {

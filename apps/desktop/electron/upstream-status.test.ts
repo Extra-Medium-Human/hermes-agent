@@ -13,6 +13,15 @@ const current = (head = 'a'.repeat(40)) =>
     message: 'Integrated'
   })
 
+test('synchronous launch failure is unverified, not a rejected promise or stale cache', async () => {
+  const checker = createUpstreamStatusChecker(() => {
+    throw new Error('python unavailable')
+  })
+
+  expect((await checker.check('/repo')).state).toBe('unverified')
+  expect((await checker.check('/repo', true)).state).toBe('unverified')
+})
+
 test('upstream parser accepts the independent read-only wire result', () => {
   expect(parseUpstreamStatus(0, current()).state).toBe('current')
   expect(
@@ -74,6 +83,7 @@ test('passive checks coalesce within TTL, but force during a passive flight wait
 
   const checker = createUpstreamStatusChecker(probe, 60_000)
   const passive = checker.check('/repo')
+  await Promise.resolve()
   const duplicate = checker.check('/repo')
   const forced = checker.check('/repo', true)
   resolveFirst({ code: 0, stdout: current() })

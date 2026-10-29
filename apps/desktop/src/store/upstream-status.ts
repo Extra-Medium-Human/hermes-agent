@@ -21,6 +21,7 @@ export function checkUpstreamStatus({ force = false }: { force?: boolean } = {})
   if (flight && !force) {
     return flight
   }
+
   const previous = flight
   let current!: Promise<NousUpstreamStatus>
   current = (async () => {

@@ -47,6 +47,9 @@ function AppUpdatesSettings({ includeUninstall }: AppUpdatesSettingsProps): Reac
   const upstreamChecking = useStore($upstreamChecking)
   const localBackend = useStore($localBackendStatus)
   const remote = connection?.mode === 'remote'
+  const installedCommit = version?.commit
+  const checkoutCommit = fork?.error ? undefined : fork?.currentSha
+  const pinsVerified = /^[0-9a-f]{40}$/.test(installedCommit ?? '') && /^[0-9a-f]{40}$/.test(checkoutCommit ?? '')
 
   // Refresh the running version when About opens or the active gateway changes.
   useEffect((): void => {
@@ -87,7 +90,7 @@ function AppUpdatesSettings({ includeUninstall }: AppUpdatesSettingsProps): Reac
             </p>
             {upstream?.state === 'upstream-not-integrated' && (
               <p className="mt-1 text-xs text-muted-foreground">
-                Integration unavailable pending explicit conflict resolution. This check cannot apply changes.
+                Integration is not available from this read-only check. Prepare and review a separate candidate.
               </p>
             )}
             <Button
@@ -106,9 +109,11 @@ function AppUpdatesSettings({ includeUninstall }: AppUpdatesSettingsProps): Reac
               {!fork?.error ? (fork?.currentSha?.slice(0, 12) ?? 'Unverified') : 'Unverified'}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              {version?.bundleOutOfSync
+              {version?.bundleOutOfSync || (pinsVerified && installedCommit !== checkoutCommit)
                 ? 'Desktop build differs from checkout'
-                : 'Build and checkout match not verified'}
+                : pinsVerified
+                  ? 'Desktop build matches checkout'
+                  : 'Build and checkout match not verified'}
             </p>
           </div>
           {remote ? (

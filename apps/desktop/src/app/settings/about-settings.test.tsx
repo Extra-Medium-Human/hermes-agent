@@ -29,7 +29,11 @@ vi.mock('@/store/local-backend-status', async () => {
 vi.mock('@/store/upstream-status', async () => {
   const { atom } = await import('nanostores')
 
-  return { $upstreamStatus: atom(null), $upstreamChecking: atom(false), checkUpstreamStatus: vi.fn().mockResolvedValue(null) }
+  return {
+    $upstreamStatus: atom(null),
+    $upstreamChecking: atom(false),
+    checkUpstreamStatus: vi.fn().mockResolvedValue(null)
+  }
 })
 
 vi.mock('@/store/session', async (importOriginal): Promise<Record<string, unknown>> => {
@@ -108,7 +112,8 @@ describe('AboutSettings', (): void => {
 
     expect(screen.getByRole('heading', { name: en.updates.appName })).toBeTruthy()
     expect(screen.getByText(en.updates.versionDetailsInstallId)).toBeTruthy()
-    expect(screen.getByText(en.updates.latestBody)).toBeTruthy()
+    expect(screen.getByText('Configured fork branch is current.')).toBeTruthy()
+    expect(screen.queryByText(en.updates.latestBody)).toBeNull()
     expect(screen.queryByText(en.updates.latestBodyBackend)).toBeNull()
     expect(refreshDesktopVersion).toHaveBeenCalledTimes(1)
     expect(checkBackendUpdates).not.toHaveBeenCalled()
@@ -127,11 +132,32 @@ describe('AboutSettings', (): void => {
     expect(checkBackendUpdates).toHaveBeenCalledTimes(2)
   })
 
+  it('compares the installed stamp to checkout separately without calling it latest', () => {
+    $desktopVersion.set({ ...$desktopVersion.get()!, commit: 'a'.repeat(40) })
+    $updateStatus.set({ supported: true, currentSha: 'a'.repeat(40), behind: 0, updateAvailable: false })
+    const { rerender } = render(<AboutSettings />)
+    expect(screen.getByText('Desktop build matches checkout')).toBeTruthy()
+    $updateStatus.set({ supported: true, currentSha: 'b'.repeat(40), behind: 0, updateAvailable: false })
+    rerender(<AboutSettings />)
+    expect(screen.getByText('Desktop build differs from checkout')).toBeTruthy()
+    expect(screen.queryByText(en.updates.latestBody)).toBeNull()
+  })
+
   it('shows independent upstream, installed build, fork and local backend evidence', async () => {
-    $updateStatus.set({ supported: true, branch: 'codex/hermes-live-current', currentSha: 'a'.repeat(40), behind: 0, updateAvailable: false })
+    $updateStatus.set({
+      supported: true,
+      branch: 'codex/hermes-live-current',
+      currentSha: 'a'.repeat(40),
+      behind: 0,
+      updateAvailable: false
+    })
     $upstreamStatus.set({
-      state: 'upstream-not-integrated', head: 'a'.repeat(40), upstream_tip: 'b'.repeat(40),
-      checked_at: Date.now(), branch: 'main', remote_url: 'https://github.com/NousResearch/hermes-agent.git',
+      state: 'upstream-not-integrated',
+      head: 'a'.repeat(40),
+      upstream_tip: 'b'.repeat(40),
+      checked_at: Date.now(),
+      branch: 'main',
+      remote_url: 'https://github.com/NousResearch/hermes-agent.git',
       message: 'Changes not integrated'
     })
     render(<AboutSettings />)
