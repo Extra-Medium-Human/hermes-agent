@@ -59,6 +59,9 @@ def test_current_check_preserves_dirty_work_index_and_fork_authority(graph):
     gitdir = Path(git(fork, "rev-parse", "--absolute-git-dir"))
     (gitdir / "info/exclude").write_text("ignored-user-work\n")
     (fork / "ignored-user-work").write_text("ignored customization")
+    git(fork, "tag", "user-local-tag")
+    git(fork, "config", "fetch.prune", "true")
+    git(fork, "config", "fetch.pruneTags", "true")
     refs = git(fork, "show-ref")
     config = gitdir / "config"
     index = config.with_name("index")
