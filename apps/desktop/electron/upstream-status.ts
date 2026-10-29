@@ -1,5 +1,7 @@
 import path from 'node:path'
 
+import { runOwnedUpstreamProbe } from './upstream-probe-process'
+
 export interface UpstreamStatus {
   state: 'current' | 'upstream-not-integrated' | 'unverified'
   head: string | null
@@ -137,12 +139,18 @@ interface CapturedProbeOptions {
 /** The Settings subprocess seam, shared by the native runtime and real-Git canary. */
 export function createPythonUpstreamStatusChecker(
   python: (root: string) => Promise<string | null>,
-  capture: (command: string, args: string[], options: CapturedProbeOptions) => Promise<{ code: number; stdout: string }>
+  capture: (
+    command: string,
+    args: string[],
+    options: CapturedProbeOptions
+  ) => Promise<{ code: number; stdout: string }> = runOwnedUpstreamProbe
 ) {
   return createUpstreamStatusChecker(async updateRoot => {
     const executable = await python(updateRoot)
 
-    if (!executable) {throw new Error('Python unavailable')}
+    if (!executable) {
+      throw new Error('Python unavailable')
+    }
 
     return capture(executable, ['-m', 'hermes_cli.upstream_status', '--repo', updateRoot], {
       cwd: updateRoot,

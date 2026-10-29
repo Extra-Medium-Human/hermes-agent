@@ -4031,7 +4031,7 @@ async function checkUpdates({ force: _force = false }: { force?: boolean } = {})
   }
 }
 
-const upstreamChecker = createPythonUpstreamStatusChecker(updateAuthorityPython, runCapturedProcess)
+const upstreamChecker = createPythonUpstreamStatusChecker(updateAuthorityPython)
 
 let updateInFlight = false
 
