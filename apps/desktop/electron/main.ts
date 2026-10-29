@@ -605,7 +605,7 @@ import {
   verifyHandoffHelperBeforeQuit
 } from './update-authority'
 import { waitForUpdateClearance } from './update-gate'
-import { createUpstreamStatusChecker } from './upstream-status'
+import { createPythonUpstreamStatusChecker } from './upstream-status'
 import {
   createOwnedUpdateGateDeps,
   createUpdateHoldScreen,
@@ -3958,9 +3958,8 @@ function emitUpdateProgress(payload) {
   }
 }
 
-// The configured fork authority check calls update_authority check, which
-// fetches that fork's tracking ref. There is no API or disk cache; force is
-// ignored here. Nous upstream has its own bounded passive cache below.
+// Fork checks fetch the configured tracking ref, without an API/disk cache.
+// Nous awareness uses a separate bounded read-only probe; fork force is ignored.
 async function checkUpdates({ force: _force = false }: { force?: boolean } = {}) {
   const updateRoot = resolveUpdateRoot()
   const authorityResult = configuredUpdateAuthority(updateRoot)
@@ -4032,17 +4031,7 @@ async function checkUpdates({ force: _force = false }: { force?: boolean } = {})
   }
 }
 
-const upstreamChecker = createUpstreamStatusChecker(async updateRoot =>
-  runCapturedProcess(await updateAuthorityPython(updateRoot),
-    ['-m', 'hermes_cli.upstream_status', '--repo', updateRoot], {
-      cwd: updateRoot,
-      env: {
-        PYTHONPATH: [updateRoot, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-        GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Never'
-      },
-      timeoutMs: 30_000
-    })
-)
+const upstreamChecker = createPythonUpstreamStatusChecker(updateAuthorityPython, runCapturedProcess)
 
 let updateInFlight = false
 
@@ -19352,9 +19341,7 @@ ipcMain.handle(
     }))
 )
 
-ipcMain.handle('hermes:upstream:check', (_event, opts?: { force?: boolean }) =>
-  upstreamChecker.check(resolveUpdateRoot(), opts?.force === true)
-)
+ipcMain.handle('hermes:upstream:check', (_event, opts) => upstreamChecker.check(resolveUpdateRoot(), opts?.force === true))
 
 ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
   applyUpdates().catch(error => ({

@@ -140,24 +140,31 @@ def test_uncertainty_never_reports_current_even_with_a_stale_success_ref(
 ):
     module, upstream, fork, calls = graph
     assert module.check_upstream(fork)["state"] == "current"
-    if problem == "missing":
-        git(fork, "remote", "remove", "origin")
-    elif problem == "wrong-url":
-        git(
+
+    def make_shallow():
+        shallow = Path(git(fork, "rev-parse", "--absolute-git-dir")) / "shallow"
+        shallow.write_text(git(fork, "rev-parse", "HEAD") + "\n")
+
+    def replace_history():
+        (fork / "replacement").write_text("replacement")
+        git(fork, "add", ".")
+        git(fork, "commit", "-m", "replacement")
+        git(fork, "replace", "HEAD~", "HEAD")
+
+    changes = {
+        "missing": lambda: git(fork, "remote", "remove", "origin"),
+        "wrong-url": lambda: git(
             fork,
             "remote",
             "set-url",
             "origin",
             "https://example.invalid/hermes-agent.git",
-        )
-    elif problem == "shallow":
-        shallow = Path(git(fork, "rev-parse", "--absolute-git-dir")) / "shallow"
-        shallow.write_text(git(fork, "rev-parse", "HEAD") + "\n")
-    elif problem == "replace":
-        (fork / "replacement").write_text("replacement")
-        git(fork, "add", ".")
-        git(fork, "commit", "-m", "replacement")
-        git(fork, "replace", "HEAD~", "HEAD")
+        ),
+        "shallow": make_shallow,
+        "replace": replace_history,
+    }
+    if problem in changes:
+        changes[problem]()
     else:
         original = module.subprocess.run
 

@@ -1,3 +1,5 @@
+import path from 'node:path'
+
 export interface UpstreamStatus {
   state: 'current' | 'upstream-not-integrated' | 'unverified'
   head: string | null
@@ -23,6 +25,14 @@ function unverified(): UpstreamStatus {
   }
 }
 
+function validPins(row: Record<string, unknown>): boolean {
+  return (
+    (row.head === null || sha(row.head)) &&
+    (row.upstream_tip === null || sha(row.upstream_tip)) &&
+    (row.state === 'unverified' || (sha(row.head) && sha(row.upstream_tip)))
+  )
+}
+
 export function parseUpstreamStatus(code: number, stdout: string): UpstreamStatus {
   if (code !== 0) {
     return unverified()
@@ -46,9 +56,7 @@ export function parseUpstreamStatus(code: number, stdout: string): UpstreamStatu
       row.checked_at <= 0 ||
       typeof row.message !== 'string' ||
       !row.message.trim() ||
-      (row.head !== null && !sha(row.head)) ||
-      (row.upstream_tip !== null && !sha(row.upstream_tip)) ||
-      (row.state !== 'unverified' && (!sha(row.head) || !sha(row.upstream_tip)))
+      !validPins(row)
     ) {
       return unverified()
     }
@@ -118,4 +126,32 @@ export function createUpstreamStatusChecker(
       return flight
     }
   }
+}
+
+interface CapturedProbeOptions {
+  cwd: string
+  env?: NodeJS.ProcessEnv
+  timeoutMs?: number
+}
+
+/** The Settings subprocess seam, shared by the native runtime and real-Git canary. */
+export function createPythonUpstreamStatusChecker(
+  python: (root: string) => Promise<string | null>,
+  capture: (command: string, args: string[], options: CapturedProbeOptions) => Promise<{ code: number; stdout: string }>
+) {
+  return createUpstreamStatusChecker(async updateRoot => {
+    const executable = await python(updateRoot)
+
+    if (!executable) {throw new Error('Python unavailable')}
+
+    return capture(executable, ['-m', 'hermes_cli.upstream_status', '--repo', updateRoot], {
+      cwd: updateRoot,
+      env: {
+        PYTHONPATH: [updateRoot, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+        GIT_TERMINAL_PROMPT: '0',
+        GCM_INTERACTIVE: 'Never'
+      },
+      timeoutMs: 30_000
+    })
+  })
 }

@@ -249,6 +249,32 @@ export function VersionHero({
   )
 }
 
+function UpdateCheckIcon({ view, status }: { view: UpdateStatusView; status: DesktopUpdateStatus | null }) {
+  return (
+    <>
+      {view.tone === 'available' ? (
+        <Codicon className="mt-0.5 size-4 shrink-0 text-primary" name="cloud-download" size="1rem" />
+      ) : view.tone === 'error' ||
+        view.tone === 'unsupported' ||
+        !(status?.behind === 0 && status.updateAvailable === false) ? null : (
+        <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+      )}
+    </>
+  )
+}
+
+function ForkIdentity({ status }: { status: DesktopUpdateStatus | null }) {
+  return (
+    <>
+      {status?.branch && (
+        <p className="mt-1 text-xs text-muted-foreground">
+          {status.branch} · {status.currentSha?.slice(0, 12) ?? 'SHA unverified'}
+        </p>
+      )}
+    </>
+  )
+}
+
 interface UpdateActionsProps {
   target: UpdateTarget
   u: Translations['updates']
@@ -329,21 +355,11 @@ export function UpdateStatusCard({
       )}
     >
       <div className="flex items-start gap-2">
-        {view.tone === 'available' ? (
-          <Codicon className="mt-0.5 size-4 shrink-0 text-primary" name="cloud-download" size="1rem" />
-        ) : view.tone === 'error' ||
-          view.tone === 'unsupported' ||
-          !(status?.behind === 0 && status.updateAvailable === false) ? null : (
-          <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
-        )}
+        <UpdateCheckIcon view={view} status={status} />
         <div className="min-w-0">
           {label && <p className="mb-1 text-xs font-semibold text-muted-foreground">{label}</p>}
           <p className="font-medium">{view.line}</p>
-          {status?.branch && (
-            <p className="mt-1 text-xs text-muted-foreground">
-              {status.branch} · {status.currentSha?.slice(0, 12) ?? 'SHA unverified'}
-            </p>
-          )}
+          <ForkIdentity status={status} />
           {view.error && <p className="mt-1 text-xs text-muted-foreground">{view.error}</p>}
           {view.tone !== 'unsupported' && (
             <p className="mt-1 text-xs text-muted-foreground">
