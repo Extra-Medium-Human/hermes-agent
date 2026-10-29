@@ -152,7 +152,7 @@ export function createPythonUpstreamStatusChecker(
       throw new Error('Python unavailable')
     }
 
-    return capture(executable, ['-m', 'hermes_cli.upstream_status', '--repo', updateRoot], {
+    return capture(executable, ['-B', '-m', 'hermes_cli.upstream_status', '--repo', updateRoot], {
       cwd: updateRoot,
       env: {
         PYTHONPATH: [updateRoot, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
