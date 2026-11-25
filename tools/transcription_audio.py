@@ -31,8 +31,13 @@ def _find_binary(binary_name: str) -> Optional[str]:
     """Find a local binary, checking common Homebrew/local prefixes as well as PATH."""
     for directory in COMMON_LOCAL_BIN_DIRS:
         candidate = Path(directory) / binary_name
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        try:
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            # /usr/local/bin can be mode 0700 root — exists() raises EACCES and
+            # used to mark all of local STT (and wake word) as unconfigured.
+            continue
     return shutil.which(binary_name)
 
 
