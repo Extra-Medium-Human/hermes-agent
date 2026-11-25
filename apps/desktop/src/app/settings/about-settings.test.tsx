@@ -3,9 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopUpdateStatus, DesktopVersionInfo, HermesConnection } from '@/global'
 import { en } from '@/i18n/en'
-import { checkLocalBackendStatus } from '@/store/local-backend-status'
+import { $confirmRequest, settleConfirm } from '@/store/confirm'
 import type * as SessionStore from '@/store/session'
 import { $connection } from '@/store/session'
+import type * as UpdatesStore from '@/store/updates'
 import {
   $backendUpdateStatus,
   $desktopVersion,
@@ -13,28 +14,12 @@ import {
   checkBackendUpdates,
   checkUpdates,
   refreshDesktopVersion,
+  setUpdateChannel,
   startActiveUpdate,
   type UpdateApplyState
 } from '@/store/updates'
-import { $upstreamStatus, checkUpstreamStatus } from '@/store/upstream-status'
 
 import { AboutSettings } from './about-settings'
-
-vi.mock('@/store/local-backend-status', async () => {
-  const { atom } = await import('nanostores')
-
-  return { $localBackendStatus: atom(null), checkLocalBackendStatus: vi.fn().mockResolvedValue(null) }
-})
-
-vi.mock('@/store/upstream-status', async () => {
-  const { atom } = await import('nanostores')
-
-  return {
-    $upstreamStatus: atom(null),
-    $upstreamChecking: atom(false),
-    checkUpstreamStatus: vi.fn().mockResolvedValue(null)
-  }
-})
 
 vi.mock('@/store/session', async (importOriginal): Promise<Record<string, unknown>> => {
   const actual = await importOriginal<typeof SessionStore>()
@@ -67,6 +52,9 @@ vi.mock('@/store/updates', async (): Promise<Record<string, unknown>> => {
     checkBackendUpdates: vi.fn<() => Promise<DesktopUpdateStatus | null>>().mockResolvedValue(null),
     checkUpdates: vi.fn<() => Promise<DesktopUpdateStatus | null>>().mockResolvedValue(null),
     refreshDesktopVersion: vi.fn<() => Promise<DesktopVersionInfo | null>>().mockResolvedValue(null),
+    setUpdateChannel: vi.fn<() => Promise<DesktopUpdateStatus | null>>().mockResolvedValue(null),
+    sourceUpdateChannel: (await vi.importActual<typeof UpdatesStore>('@/store/updates')).sourceUpdateChannel,
+    sourceUpdateTrack: (await vi.importActual<typeof UpdatesStore>('@/store/updates')).sourceUpdateTrack,
     openUpdateOverlayFor: vi.fn(),
     openUpdatesWindow: vi.fn(),
     startActiveUpdate: vi.fn()
@@ -98,9 +86,8 @@ describe('AboutSettings', (): void => {
       hermesRoot: '/test/hermes',
       installId: 'test-install'
     })
-    $updateStatus.set({ supported: true, behind: 0, updateAvailable: false })
-    $backendUpdateStatus.set({ supported: true, behind: 0, updateAvailable: false })
-    $upstreamStatus.set(null)
+    $updateStatus.set({ supported: true, behind: 0 })
+    $backendUpdateStatus.set({ supported: true, behind: 0 })
   })
 
   afterEach((): void => {
@@ -112,8 +99,7 @@ describe('AboutSettings', (): void => {
 
     expect(screen.getByRole('heading', { name: en.updates.appName })).toBeTruthy()
     expect(screen.getByText(en.updates.versionDetailsInstallId)).toBeTruthy()
-    expect(screen.getByText('Configured fork branch is current.')).toBeTruthy()
-    expect(screen.queryByText(en.updates.latestBody)).toBeNull()
+    expect(screen.getByText(en.updates.latestBody)).toBeTruthy()
     expect(screen.queryByText(en.updates.latestBodyBackend)).toBeNull()
     expect(refreshDesktopVersion).toHaveBeenCalledTimes(1)
     expect(checkBackendUpdates).not.toHaveBeenCalled()
@@ -132,51 +118,13 @@ describe('AboutSettings', (): void => {
     expect(checkBackendUpdates).toHaveBeenCalledTimes(2)
   })
 
-  it('compares the installed stamp to checkout separately without calling it latest', () => {
-    $desktopVersion.set({ ...$desktopVersion.get()!, commit: 'a'.repeat(40) })
-    $updateStatus.set({ supported: true, currentSha: 'a'.repeat(40), behind: 0, updateAvailable: false })
-    const { rerender } = render(<AboutSettings />)
-    expect(screen.getByText('Desktop build matches checkout')).toBeTruthy()
-    $updateStatus.set({ supported: true, currentSha: 'b'.repeat(40), behind: 0, updateAvailable: false })
-    rerender(<AboutSettings />)
-    expect(screen.getByText('Desktop build differs from checkout')).toBeTruthy()
-    expect(screen.queryByText(en.updates.latestBody)).toBeNull()
-  })
-
-  it('shows independent upstream, installed build, fork and local backend evidence', async () => {
-    $updateStatus.set({
-      supported: true,
-      branch: 'codex/hermes-live-current',
-      currentSha: 'a'.repeat(40),
-      behind: 0,
-      updateAvailable: false
-    })
-    $upstreamStatus.set({
-      state: 'upstream-not-integrated',
-      head: 'a'.repeat(40),
-      upstream_tip: 'b'.repeat(40),
-      checked_at: Date.now(),
-      branch: 'main',
-      remote_url: 'https://github.com/NousResearch/hermes-agent.git',
-      message: 'Changes not integrated'
-    })
+  it('hides the Hermes Cloud backend update card and never checks it', (): void => {
+    $connection.set({ ...connection('remote'), baseUrl: 'https://lab.agents.nousresearch.com', remoteKind: 'cloud' })
     render(<AboutSettings />)
-    expect(screen.getByText('Fork update')).toBeTruthy()
-    expect(screen.getByText('Nous upstream')).toBeTruthy()
-    expect(screen.getByText('Changes not integrated')).toBeTruthy()
-    expect(screen.getByText('Installed Desktop')).toBeTruthy()
-    expect(screen.getByText('Connected backend')).toBeTruthy()
-    expect(checkLocalBackendStatus).toHaveBeenCalledTimes(1)
-    expect(checkUpstreamStatus).toHaveBeenCalled()
-  })
 
-  it('keeps upstream status independent when fork authority fails and forces both checks', async () => {
-    $updateStatus.set({ supported: true, error: 'AUTHORITY_UNVERIFIED', message: 'fork failed' })
-    render(<AboutSettings />)
-    expect(screen.getAllByText('Could not verify').length).toBeGreaterThan(0)
-    fireEvent.click(screen.getAllByRole('button', { name: en.updates.checkNow })[0])
-    await waitFor(() => expect(checkUpstreamStatus).toHaveBeenCalledWith({ force: true }))
-    expect(checkUpdates).toHaveBeenCalledWith({ force: true })
+    expect(screen.getByText(en.updates.latestBody)).toBeTruthy()
+    expect(screen.queryByText(en.updates.latestBodyBackend)).toBeNull()
+    expect(checkBackendUpdates).not.toHaveBeenCalled()
   })
 
   it('shows the fixed package channel with no selector', (): void => {
@@ -184,6 +132,51 @@ describe('AboutSettings', (): void => {
     render(<AboutSettings />)
     expect(screen.getByText(`${en.updates.version('1.2.3')} · ${en.updates.channels.canary}`)).toBeTruthy()
     expect(screen.queryByRole('combobox')).toBeNull()
+  })
+
+  it('lets a source checkout pick its channel and confirms the move to stable releases', async (): Promise<void> => {
+    const about = en.settings.about.channel
+    const source = { supported: true, behind: 0, mechanism: 'posix-handoff', channelSelectable: true } as const
+    // The save resolves only when released, so the in-flight paint is observable.
+    let release!: () => void
+    vi.mocked(setUpdateChannel).mockImplementationOnce(
+      () => new Promise(resolve => (release = () => resolve({ ...source, channel: 'stable' })))
+    )
+    $updateStatus.set({ ...source, branch: 'main' })
+    render(<AboutSettings />)
+    expect(screen.getByRole('button', { name: about.main }).getAttribute('aria-pressed')).toBe('true')
+
+    fireEvent.click(screen.getByRole('button', { name: about.stable }))
+    await waitFor((): void => {
+      expect($confirmRequest.get()?.title).toBe(about.stableConfirmTitle)
+    })
+    expect(setUpdateChannel).not.toHaveBeenCalled()
+    settleConfirm(true)
+    await waitFor((): void => {
+      expect(setUpdateChannel).toHaveBeenCalledWith('stable')
+    })
+    // The confirmed choice shows while the save + check is still running.
+    expect(screen.getByRole('button', { name: about.stable }).getAttribute('aria-pressed')).toBe('true')
+    release()
+
+    // Back to every commit is never older code, so it needs no confirmation.
+    $updateStatus.set({ ...source, channel: 'stable' })
+    await waitFor((): void => {
+      expect(screen.getByRole('button', { name: about.stable }).getAttribute('aria-pressed')).toBe('true')
+    })
+    fireEvent.click(screen.getByRole('button', { name: about.main }))
+    await waitFor((): void => {
+      expect(setUpdateChannel).toHaveBeenCalledWith('main')
+    })
+    expect($confirmRequest.get()).toBeNull()
+
+    // An older runtime cannot save a channel, and a packaged install owns its own.
+    $updateStatus.set({ ...source, channel: 'stable', channelSelectable: undefined })
+    await waitFor((): void => {
+      expect(screen.queryByText(about.title)).toBeNull()
+    })
+    $updateStatus.set({ ...source, mechanism: 'electron-updater', channel: 'stable' })
+    expect(screen.queryByText(about.title)).toBeNull()
   })
 
   it('a commit client refuses updates without hiding an unrelated backend update', (): void => {

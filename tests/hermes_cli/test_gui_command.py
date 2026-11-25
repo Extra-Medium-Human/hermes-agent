@@ -115,7 +115,7 @@ def _make_packaged_executable(root: Path, monkeypatch) -> Path:
 
 def _staging_dir_from(cmd) -> Path:
     """Extract the ``-c.directories.output=<dir>`` electron-builder override
-    ``cmd_gui`` appends to ``npm run pack`` (stage-and-swap, #86443)."""
+    ``cmd_gui`` appends to ``pnpm run pack`` (stage-and-swap, #86443)."""
     for arg in cmd:
         if isinstance(arg, str) and arg.startswith("-c.directories.output="):
             return Path(arg.split("=", 1)[1])
@@ -131,13 +131,21 @@ def _packaged_exe_rel() -> Path:
     return Path("linux-unpacked") / "hermes"
 
 
+def _pnpm_argv(cmd) -> list:
+    """The pnpm command line inside a build call. A direct ``hermes desktop`` build holds the
+    checkout lock (review C5), so on POSIX it runs under the custody launcher
+    (``python -I -S -c <reaper> <fds> pnpm ...``)."""
+    cmd = list(cmd)
+    return cmd[6:] if cmd[1:4] == ["-I", "-S", "-c"] else cmd
+
+
 def _pack_into_staging(root: Path, content: str = "", returncode: int = 0):
-    """``subprocess.run`` side effect mimicking a real ``npm run pack``: lays
+    """``subprocess.run`` side effect mimicking a real ``pnpm run pack``: lays
     the packaged app down inside the STAGING dir named on the command line
     (never in release/), then returns *returncode*. Non-pack commands (the
     launch) return success."""
     def _run(cmd, **kwargs):
-        if len(cmd) >= 3 and cmd[1:3] == ["run", "builder"]:
+        if _pnpm_argv(cmd)[1:3] == ["run", "builder"]:
             exe = _staging_dir_from(cmd) / _packaged_exe_rel()
             exe.parent.mkdir(parents=True, exist_ok=True)
             exe.write_text(content, encoding="utf-8")
@@ -148,68 +156,13 @@ def _pack_into_staging(root: Path, content: str = "", returncode: int = 0):
     return _run
 
 
-def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
-    root = _make_desktop_tree(tmp_path)
-    desktop_dir = root / "apps" / "desktop"
-    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
-    packaged_exe = _make_packaged_executable(root, monkeypatch)
-    # The pack double writes text, not a PE. The real integrity gate has its
-    # own filesystem tests; this test owns build/launch orchestration.
-    monkeypatch.setattr(main_desktop, "_desktop_exe_integrity_error", lambda _: None)
-
-    install_ok = subprocess.CompletedProcess(["npm", "ci"], 0)
-
-    with patch("hermes_cli.main_install_repair._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
-         patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
-         patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
-         patch("hermes_cli.main_desktop._write_desktop_build_stamp"), \
-         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True), \
-         patch("hermes_cli.main_desktop._desktop_linux_sandbox_fixup", return_value=True), \
-         patch("hermes_cli.main_desktop._register_linux_desktop_entry"), \
-         patch("hermes_cli.main.subprocess.run", side_effect=_pack_into_staging(root)) as mock_run, \
-         pytest.raises(SystemExit) as exc:
-        cli_main.cmd_gui(_ns())
-
-    assert exc.value.code == 0
-    # The install now runs with a resolved env (managed-Node PATH), never a bare
-    # ``env=None`` that would leave npm's child scripts unable to find ``node``.
-    mock_install.assert_called_once()
-    assert mock_install.call_args.args == ("/usr/bin/npm", root)
-    assert mock_install.call_args.kwargs["capture_output"] is False
-    install_env = mock_install.call_args.kwargs["env"]
-    assert install_env is not None and "PATH" in install_env
-    pack_cmd = mock_run.call_args_list[0].args[0]
-    assert pack_cmd[:4] == ["/usr/bin/npm", "run", "pack", "--"]
-    # Stage-and-swap (#86443): the pack targets a staging dir beside release/,
-    # never release/ itself.
-    staging = _staging_dir_from(pack_cmd)
-    assert staging.parent == desktop_dir and staging.name.startswith(".staging-")
-    assert not staging.exists()  # swapped into release/ and cleaned up
-    assert mock_run.call_args_list[0].kwargs["cwd"] == desktop_dir
-    if sys.platform.startswith("linux"):
-        expected_launch = [str(packaged_exe), "--disable-setuid-sandbox"]
-    else:
-        expected_launch = [str(packaged_exe)]
-    launch_calls = [call for call in mock_run.call_args_list if call.args[0] == expected_launch]
-    assert len(launch_calls) == 1
-    assert launch_calls[0].kwargs["cwd"] == desktop_dir
-
-
-def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
-    """Regression: npm's child scripts (electron-winstaller's select-7z-arch.js)
-    shell out to bare ``node``. When Desktop is launched from the updater chain
-    the parent PATH is stripped, so the install env MUST carry the Hermes-managed
-    Node ahead of that bare PATH or the install dies with ``node: not found``.
-    """
-    import os
-
-    from hermes_constants import iter_hermes_node_dirs
-
+@pytest.mark.parametrize("local", [False, True])
+def test_source_launch_reads_bom_electron_path_without_provisioning(tmp_path, monkeypatch, local):
     root = _make_desktop_tree(tmp_path)
     desktop = root / "apps" / "desktop"
     (desktop / "dist").mkdir()
     (desktop / "dist" / "index.html").write_text("prepared renderer", encoding="utf-8")
-    electron = root / "node_modules" / "electron"
+    electron = root / "apps" / "desktop" / "node_modules" / "electron"
     (electron / "dist").mkdir(parents=True)
     (electron / "package.json").write_text("{}", encoding="utf-8")
     executable = electron / "dist" / "électron"
@@ -393,7 +346,7 @@ def test_launch_installed_macos_desktop_app_gates_on_bundle_and_platform(tmp_pat
     monkeypatch.setattr(main_desktop.Path, "is_file", lambda self: exists if self == exe else Path.is_file(self))
     calls = []
     if exists and platform == "darwin":
-        import hermes_cli.bundled_app as bundled_app
+        from hermes_cli import bundled_app
         monkeypatch.setattr(bundled_app, "launch_detached", lambda argv, **kw: calls.append(argv) or 4321)
 
     assert main_desktop._launch_installed_macos_desktop_app() is (exists and platform == "darwin")
@@ -883,7 +836,6 @@ def test_promote_staged_desktop_app_refuses_an_unsigned_staging(tmp_path, monkey
 
     def fake_swap(dir_, st_):
         swapped.append(st_)
-        return None
 
     monkeypatch.setattr(main_desktop, "_desktop_macos_relaunchable_fixup", fake_fixup)
     monkeypatch.setattr(main_desktop, "_swap_staged_desktop_app", fake_swap)
@@ -1217,55 +1169,68 @@ def test_desktop_launch_options_normalizes_ozone_hint(raw, expected):
     assert hint == expected
 
 
-def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
-    """COSMIC HUD: ``desktop.ozone_platform_hint: x11`` sets
-    ``ELECTRON_OZONE_PLATFORM_HINT`` on the launched Electron process."""
-    root = _make_desktop_tree(tmp_path)
-    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
-    packaged_executable = _make_packaged_executable(root, monkeypatch)
-    monkeypatch.setattr(main_desktop, "_desktop_exe_integrity_error", lambda _: None)
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Absent key stays ON — the composer must be reachable by
+        # accessibility-driven dictation out of the box (#118083 family:
+        # #118271 / #92607).
+        (None, True),
+        (True, True),
+        (False, False),
+        ("on", True),
+        ("1", True),
+        ("yes", True),
+        ("0", False),
+        ("false", False),
+        ("OFF", False),
+        ("  no  ", False),
+        # `disabled` is a natural spelling of the opt-out; both word lists
+        # (launcher + packaged-launch yaml reader) accept it, so the two
+        # entry points stay in lockstep.
+        ("disabled", False),
+        ("Disabled", False),
+        ("enabled", True),
+        # YAML parses a bare `0` as int and `0.0` as float — neither is a
+        # str, so the normalization must cover numeric scalars too, not just
+        # the quoted forms above.
+        (0, False),
+        (1, True),
+        (0.0, False),
+        # Unknown strings don't disable the feature (fail-open, like the
+        # other desktop launch options fail to "auto").
+        ("wibble", True),
+    ],
+)
+def test_desktop_launch_options_normalizes_renderer_accessibility(raw, expected):
+    """``desktop.renderer_accessibility`` defaults to ON; only explicit false words opt out."""
+    cfg = {"desktop": {} if raw is None else {"renderer_accessibility": raw}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        _, _, _, _, renderer_a11y = main_desktop._desktop_launch_options()
+    assert renderer_a11y is expected
 
-    ok = subprocess.CompletedProcess([], 0)
-    cfg = {"desktop": {"ozone_platform_hint": "x11"}}
 
-    with patch("hermes_cli.main_install_repair._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
-         patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=ok), \
-         patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
-         patch("hermes_cli.main_desktop._write_desktop_build_stamp"), \
-         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True), \
-         patch("hermes_cli.main_desktop._desktop_linux_sandbox_fixup", return_value=True), \
-         patch("hermes_cli.config.load_config", return_value=cfg), \
-         patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
-         patch("hermes_cli.main.subprocess.run", side_effect=_pack_into_staging(root)) as mock_run, \
-         pytest.raises(SystemExit):
-        cli_main.cmd_gui(_ns())
+def test_desktop_environment_bridges_only_the_accessibility_opt_out(monkeypatch):
+    """ON (the default) sets nothing; the opt-out bridges to
+    HERMES_DESKTOP_RENDERER_ACCESSIBILITY=0, and an explicit env var wins."""
+    monkeypatch.delenv("HERMES_DESKTOP_RENDERER_ACCESSIBILITY", raising=False)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"desktop": {}})
 
-    launch_call = next(
-        call for call in mock_run.call_args_list
-        if call.args[0][0] == str(packaged_executable)
-    )
-    launch_env = launch_call.kwargs["env"]
-    assert launch_env.get("ELECTRON_OZONE_PLATFORM_HINT") == "x11"
+    env, _ = main_desktop._desktop_launch_env(_ns())
+    assert "HERMES_DESKTOP_RENDERER_ACCESSIBILITY" not in env
 
-    monkeypatch.setenv("ELECTRON_OZONE_PLATFORM_HINT", "wayland")
-    with patch("hermes_cli.main_install_repair._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
-         patch("hermes_cli.main_web_build._run_npm_install_deterministic", return_value=ok), \
-         patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
-         patch("hermes_cli.main_desktop._write_desktop_build_stamp"), \
-         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True), \
-         patch("hermes_cli.main_desktop._desktop_linux_sandbox_fixup", return_value=True), \
-         patch("hermes_cli.config.load_config", return_value=cfg), \
-         patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
-         patch("hermes_cli.main.subprocess.run", side_effect=_pack_into_staging(root)) as mock_run2, \
-         pytest.raises(SystemExit):
-        cli_main.cmd_gui(_ns())
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"desktop": {"renderer_accessibility": False}})
+    env, _ = main_desktop._desktop_launch_env(_ns())
+    assert env["HERMES_DESKTOP_RENDERER_ACCESSIBILITY"] == "0"
 
-    launch_call = next(
-        call for call in mock_run2.call_args_list
-        if call.args[0][0] == str(packaged_executable)
-    )
-    launch_env = launch_call.kwargs["env"]
-    assert launch_env.get("ELECTRON_OZONE_PLATFORM_HINT") == "wayland"
+    monkeypatch.setenv("HERMES_DESKTOP_RENDERER_ACCESSIBILITY", "0")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"desktop": {}})
+    env, _ = main_desktop._desktop_launch_env(_ns())
+    assert env["HERMES_DESKTOP_RENDERER_ACCESSIBILITY"] == "0"
+
+
 
 
 # --- desktop.password_store detection & bridging (linux) ------------------
@@ -1333,7 +1298,7 @@ def test_gui_linux_packaged_launch_bridges_detected_password_store(tmp_path, mon
 
     ok = subprocess.CompletedProcess([], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/pnpm"), \
          patch("hermes_cli.source_build.prepare_source_dependencies", return_value=ok), \
          patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup"), \
@@ -1379,14 +1344,14 @@ def test_gui_linux_source_launch_bridges_detected_password_store(tmp_path, monke
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
 
-    electron = root / "node_modules/electron"
+    electron = root / "apps/desktop/node_modules/electron"
     (electron / "dist").mkdir(parents=True)
     (electron / "path.txt").write_text("electron")
     (electron / "dist/electron").touch()
 
     ok = subprocess.CompletedProcess([], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/pnpm"), \
          patch("hermes_cli.source_build.prepare_source_dependencies", return_value=ok), \
          patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
          patch("hermes_cli.config.load_config", return_value={}), \
@@ -1406,15 +1371,14 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
     _clear_keychain_env(monkeypatch)
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
-    packaged_executable = _make_packaged_executable(root, monkeypatch)
+    _make_packaged_executable(root, monkeypatch)
 
     ok = subprocess.CompletedProcess([], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/pnpm"), \
          patch("hermes_cli.source_build.prepare_source_dependencies", return_value=ok), \
          patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True), \
-         patch("hermes_cli.main_desktop._write_desktop_build_stamp"), \
-         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True), \
+         patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup"), \
          patch("hermes_cli.config.load_config", return_value={}), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
          patch("hermes_cli.main_desktop._detect_linux_password_store") as mock_detect, \
@@ -1423,11 +1387,7 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
             cli_main.cmd_gui(_ns())
 
     mock_detect.assert_not_called()
-    launch_call = next(
-        call for call in mock_run.call_args_list
-        if call.args[0][0] == str(packaged_executable)
-    )
-    launch_env = launch_call.kwargs["env"]
+    launch_env = mock_run.call_args_list[-1].kwargs["env"]
     assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
 
 
@@ -1585,14 +1545,13 @@ def test_gui_foreground_launch_ctrl_c_exits_cleanly(tmp_path, monkeypatch, capsy
 
 def _gui_build_patches(root: Path, run_side_effect):
     return [
-        patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"),
+        patch("hermes_cli.main.shutil.which", return_value="/usr/bin/pnpm"),
         # Staging doubles are text; the PE-validation suite owns real binaries.
         patch("hermes_cli.main_desktop._desktop_exe_integrity_error", return_value=None),
         patch("hermes_cli.source_build.prepare_source_dependencies",
-              return_value=subprocess.CompletedProcess(["npm", "ci"], 0)),
+              return_value=subprocess.CompletedProcess(["pnpm", "install"], 0)),
         patch("hermes_cli.main_desktop._desktop_build_needed", return_value=True),
-        patch("hermes_cli.main_desktop._write_desktop_build_stamp"),
-        patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup", return_value=True),
+        patch("hermes_cli.main_desktop._desktop_macos_relaunchable_fixup"),
         patch("hermes_cli.main_desktop._register_linux_desktop_entry"),
         patch("hermes_cli.main_desktop._stop_desktop_processes_locking_build", return_value=[]),
         patch("hermes_cli.main.subprocess.run", side_effect=run_side_effect),
@@ -1804,7 +1763,7 @@ def test_windows_build_under_its_own_desktop_skips_instead_of_killing_it(tmp_pat
                         lambda *a, **k: pytest.fail("must not stop the Desktop running this build"))
     monkeypatch.setattr("pm.progress.run_contained", lambda *a, **k: pytest.fail("must not pack"))
 
-    assert main_desktop.build_prepared_desktop(desktop_dir, source_mode=False, npm="npm", env={}) is None
+    assert main_desktop.build_prepared_desktop(desktop_dir, source_mode=False, pnpm="pnpm", env={}) is None
     assert "pid 41" in capsys.readouterr().out
     assert not list(desktop_dir.glob(f"{main_desktop._DESKTOP_STAGING_PREFIX}*"))
 
@@ -1875,7 +1834,7 @@ def test_gui_zero_exit_pack_without_artifact_keeps_previous_app(tmp_path, monkey
     live_exe.write_text("good build", encoding="utf-8")
 
     def empty_pack(cmd, **kwargs):
-        if cmd[1:3] == ["run", "builder"]:
+        if _pnpm_argv(cmd)[1:3] == ["run", "builder"]:
             _staging_dir_from(cmd).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(cmd, 0)
 

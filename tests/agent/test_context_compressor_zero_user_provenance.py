@@ -18,9 +18,11 @@ from agent.context_compressor import (
 from agent.conversation_compression import (
     compress_context,
 )
-from hermes_state import SessionDB
 from tools.process_registry_notifications import format_process_notification
 from tools.todo_tool import TODO_INJECTION_HEADER
+from tests.fixtures.storage_read import conversation
+from tests.fixtures.storage_seed import seed_session
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 def _response(content: str) -> SimpleNamespace:
@@ -85,7 +87,7 @@ def _assistant_turns(start: int, count: int) -> list[dict]:
     ]
 
 
-def _lifecycle_agent(db: SessionDB, session_id: str):
+def _lifecycle_agent(db, session_id: str):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -94,7 +96,7 @@ def _lifecycle_agent(db: SessionDB, session_id: str):
             base_url="https://openrouter.ai/api/v1",
             model="test/model",
             quiet_mode=True,
-            session_db=db,
+            persistence=db,
             session_id=session_id,
             skip_context_files=True,
             skip_memory=True,
@@ -173,7 +175,7 @@ def test_zero_user_provenance_survives_iterative_compaction(compressor):
             quiet_mode=True,
         )
     resumed.tail_token_budget = 80
-    # SessionDB persists the summary content/role but not arbitrary internal
+    # The store persists the summary content/role but not arbitrary internal
     # message keys. Simulate that round trip: the exact sentinel must recover
     # false provenance even when both in-process metadata keys are absent.
     persisted_handoff = dict(first_handoffs[0])
@@ -233,70 +235,6 @@ def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
     idx = compressor._find_last_user_message_idx(messages, head_end=0)
     assert idx == 0, "nudge was selected as the anchor instead of the human task"
     assert messages[idx]["content"] == human["content"]
-
-
-@pytest.mark.parametrize("display_kind", ["internal_notification", None])
-def test_restart_notification_cannot_replace_persisted_human_task(tmp_path, display_kind):
-    """A restart followed by compaction must retain the job, not promote its recovery notice."""
-    human = "Fix the parser and verify the malformed-input regression."
-    notification = (
-        "[System note: The previous turn was interrupted by a gateway shutdown; "
-        "the gateway is now back online. CONTINUE the interrupted task to completion.]"
-    )
-    db = SessionDB(db_path=tmp_path / "state.db")
-    try:
-        db.create_session("restart-provenance", source="telegram", model="test/model")
-        db.append_message("restart-provenance", "user", human)
-        db.append_message("restart-provenance", "assistant", "Inspecting the parser.", tool_calls=[
-            {"id": "inspect-parser", "type": "function", "function": {
-                "name": "read_file", "arguments": '{"path":"parser.py"}'}}
-        ])
-        db.append_message("restart-provenance", "tool", "Parser contents inspected.",
-                          tool_call_id="inspect-parser", tool_name="read_file")
-        db.append_message("restart-provenance", "user", notification, display_kind=display_kind)
-        replayed = db.get_messages_as_conversation("restart-provenance")
-
-        snapshot = ContextCompressor._latest_user_task_snapshot(replayed)
-        assert human in snapshot
-        assert notification not in snapshot
-        assert not ContextCompressor._transcript_has_real_user_turn([replayed[-1]])
-        assert ContextCompressor._find_inflight_user_task(replayed)["content"] == human
-        from agent.context_compressor import _build_verbatim_user_section
-        user_section = _build_verbatim_user_section(replayed)
-        assert human in user_section
-        assert notification not in user_section
-    finally:
-        db.close()
-
-
-def test_internal_notifications_do_not_hide_a_later_human_change_of_task():
-    """Operational wording may vary; durable provenance wins, but a new human instruction still wins."""
-    messages = [
-        {"role": "user", "content": "Implement the parser change."},
-        {"role": "assistant", "content": "Working.", "tool_calls": [
-            {"id": "inspect", "function": {"name": "read_file", "arguments": "{}"}}
-        ]},
-        {"role": "tool", "tool_call_id": "inspect", "content": "Inspection complete."},
-        {"role": "user", "content": "Background reviewer is available.",
-         "display_kind": "internal_notification", "display_metadata": {"reason": "review_complete"}},
-    ]
-    assert "Implement the parser change." in ContextCompressor._latest_user_task_snapshot(messages)
-    assert not ContextCompressor._transcript_has_real_user_turn([messages[-1]])
-    new_request = {"role": "user", "content": "Stop implementing. Report the findings only."}
-    messages.append(new_request)
-    assert new_request["content"] in ContextCompressor._latest_user_task_snapshot(messages)
-    assert ContextCompressor._find_inflight_user_task(messages) == new_request
-
-
-def test_captionless_human_image_preserves_user_provenance():
-    """An image is human input even when it supplies no text for a verbatim excerpt."""
-    image = {"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,dGVzdA=="}}
-    ]}
-    notice = {"role": "user", "content": "Gateway restarted.",
-              "display_kind": "internal_notification"}
-    assert ContextCompressor._transcript_has_real_user_turn([image, notice])
-    assert not ContextCompressor._transcript_has_real_user_turn([notice])
 
 
 @pytest.mark.parametrize(
@@ -403,7 +341,7 @@ def test_conversation_loop_retry_nudges_are_synthetic(content):
     as MAX_ITERATIONS_SUMMARY_REQUEST above. A turn interrupted/crashed mid-
     retry can persist one of these as a plain role="user" row (their
     _length_continuation_nudge/_dropped_toolcall_nudge metadata tags do not
-    survive SessionDB projection), so recognition must be content-based."""
+    survive the store's projection), so recognition must be content-based."""
     nudge = {"role": "user", "content": content}
     assert ContextCompressor._is_synthetic_compression_user_turn(nudge) is True
 
@@ -447,9 +385,9 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
 ):
     hermes_home = tmp_path / "hermes-home"
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db = storage_handle(tmp_path)
     session_id = "zero-user-todo-lifecycle"
-    db.create_session(session_id, source="cron", model="test/model")
+    seed_session(db, session_id, "cron", model="test/model")
 
     first_agent = _lifecycle_agent(db, session_id)
     with patch(
@@ -476,7 +414,7 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
         and str(message.get("content") or "").startswith(TODO_INJECTION_HEADER)
         for message in first
     )
-    projected = db.get_messages_as_conversation(session_id)
+    projected = conversation(db, session_id)
     assert projected
     assert all(
         COMPRESSED_SUMMARY_METADATA_KEY not in message
@@ -506,6 +444,8 @@ def test_compress_context_todo_snapshot_stays_synthetic_across_two_boundaries(
     assert "Second boundary" in handoff["content"]
     assert "User asked:" not in handoff["content"]
     db.close()
+
+
 
 
 

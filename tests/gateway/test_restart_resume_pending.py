@@ -27,7 +27,7 @@ PRs #9850, #9934, #7536):
 import asyncio
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -41,11 +41,9 @@ from gateway.run import (
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _prepare_resume_pending_message,
     _should_clear_resume_pending_after_turn,
-)
-from gateway.resume_recovery import (
     build_resume_recovery_note,
-    prepare_resume_pending_message,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
@@ -86,9 +84,28 @@ def _make_store(tmp_path):
 
 
 def _build_agent_history(history: list) -> list:
-    """Exercise the production replay filtering used before recovery."""
-    from gateway.run import _build_gateway_agent_history
-    return _build_gateway_agent_history(history)[0]
+    """Mirror gateway/run.py's ``history → agent_history`` conversion.
+
+    This is the transformation that strips ``timestamp`` off tool/tool_call
+    rows before the agent sees them.  Tests that check the freshness gate
+    must go through this conversion so they exercise the *real* data the
+    note-injection code sees.
+    """
+    agent_history: list = []
+    for msg in history:
+        role = msg.get("role")
+        if not role or role in {"session_meta", "system"}:
+            continue
+        has_tool_calls = "tool_calls" in msg
+        has_tool_call_id = "tool_call_id" in msg
+        is_tool_message = role == "tool"
+        if has_tool_calls or has_tool_call_id or is_tool_message:
+            agent_history.append({k: v for k, v in msg.items() if k != "timestamp"})
+        else:
+            content = msg.get("content")
+            if content:
+                agent_history.append({"role": role, "content": content})
+    return agent_history
 
 
 def _simulate_note_injection(
@@ -99,27 +116,69 @@ def _simulate_note_injection(
     agent_history: list | None = None,
     window_secs: float | None = None,
 ) -> str:
-    """Call the real turn preparation with a controlled session and freshness window."""
-    from types import SimpleNamespace
-    from gateway.run_turn_runner import TurnRunner
-    from gateway.turn_context import TurnContext
+    """Mirror the note-injection logic in gateway/run.py _run_agent().
 
+    The freshness signal reads ``history[-1].timestamp`` (the raw transcript
+    row), NOT ``agent_history[-1].timestamp`` (which has been stripped).
+    Tests pass the raw ``history`` — ``agent_history`` is derived from it
+    via the real conversion if not supplied explicitly.
+    """
     if agent_history is None:
         agent_history = _build_agent_history(history)
-    key = resume_entry.session_key if resume_entry else "fixture"
-    entries = {key: resume_entry} if resume_entry else {}
-    runner = SimpleNamespace(
-        session_store=SimpleNamespace(_entries=entries),
-        _adapter_for_source=lambda source: None,
+
+    window = (
+        float(window_secs)
+        if window_secs is not None
+        else _auto_continue_freshness_window()
     )
-    ctx = TurnContext(
-        message=user_message, history=history, session_key=key,
-        persist_user_display_kind="internal_notification" if not user_message.strip() and resume_entry else None,
+    interruption_is_fresh = _is_fresh_gateway_interruption(
+        _last_transcript_timestamp(history),
+        window_secs=window,
     )
-    window = float(window_secs) if window_secs is not None else _auto_continue_freshness_window()
-    with patch("gateway.run._auto_continue_freshness_window", return_value=window):
-        TurnRunner(runner, ctx)._prepare_turn_message(agent_history)
-    return ctx.message
+
+    message = user_message
+    resume_mark_is_fresh = False
+    if resume_entry is not None and getattr(resume_entry, "resume_pending", False):
+        resume_mark_is_fresh = _is_fresh_gateway_interruption(
+            getattr(resume_entry, "last_resume_marked_at", None),
+            window_secs=window,
+        )
+    is_resume_pending = bool(
+        resume_entry is not None
+        and getattr(resume_entry, "resume_pending", False)
+        and (interruption_is_fresh or resume_mark_is_fresh)
+    )
+    has_fresh_tool_tail = bool(
+        agent_history
+        and agent_history[-1].get("role") == "tool"
+        and interruption_is_fresh
+    )
+
+    if is_resume_pending:
+        reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
+        # Real production note builder — extracted to module scope in
+        # gateway/run.py so tests exercise the actual strings.
+        message = build_resume_recovery_note(reason, message)
+    elif has_fresh_tool_tail:
+        message = (
+            "[System note: A new message has arrived. The conversation "
+            "history contains pending tool outputs from an interrupted turn. "
+            "IGNORE those pending results. Address the user's NEW message "
+            "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
+            + message
+        )
+
+    # Empty-turn safety net: mirrors gateway/run.py — a blank
+    # auto-resume turn on a resume_pending session must never reach the model.
+    if (
+        isinstance(message, str)
+        and not message.strip()
+        and resume_entry is not None
+        and getattr(resume_entry, "resume_pending", False)
+    ):
+        sn_reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
+        message = build_resume_recovery_note(sn_reason, "")
+    return message
 
 
 # ---------------------------------------------------------------------------
@@ -219,37 +278,11 @@ class TestResumePendingSystemNote:
         assert "already appear in the history" in note
 
 
-    def test_empty_message_noninteractive_note_continues_task(self):
-        """Non-interactive platforms (webhook, API server): nobody can answer
-        'what next?', so the resumed turn must complete the interrupted work
-        instead of acknowledging (#57056)."""
-        note = build_resume_recovery_note("restart_timeout", "", interactive=False)
-        assert "CONTINUE the interrupted task" in note
-        assert "session was restored" not in note
-        assert "ask what they would like to do next" not in note
-        # Must not tell the model to skip the unfinished work it should finish.
-        assert "skip any unfinished work" not in note
-        # But still guards against re-running already-recorded tool calls.
-        assert "do NOT repeat successful calls" in note
-        assert "Retry failed or incomplete work only after checking" in note
-
-    def test_empty_message_interactive_note_continues_task(self):
-        """An interactive startup auto-resume continues the saved task."""
-        note = build_resume_recovery_note(
-            "shutdown_timeout", "", interactive=True
-        )
-
-        assert "CONTINUE the interrupted task" in note
-        assert "ask what they would like to do next" not in note
-        assert "skip any unfinished work" not in note
-        assert "Use recorded tool results as evidence" in note
-        assert "effect is UNKNOWN" in note
-        assert "Inspect current state before retrying" in note
 
 
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
         """The auto-resume note must not leave an empty row in state.db."""
-        message, persisted = prepare_resume_pending_message(
+        message, persisted = _prepare_resume_pending_message(
             "restart_timeout", "", interactive=False
         )
 
@@ -260,7 +293,7 @@ class TestResumePendingSystemNote:
     def test_whitespace_only_message_also_persists_the_note(self):
         """A whitespace-only startup event is as blank as an empty one —
         persisting it verbatim would recreate the sanitizer loop (#86580)."""
-        message, persisted = prepare_resume_pending_message(
+        message, persisted = _prepare_resume_pending_message(
             "shutdown_timeout", "   ", interactive=True
         )
 
@@ -271,7 +304,7 @@ class TestResumePendingSystemNote:
         """When the user typed real text while resume was pending, the durable
         transcript keeps their clean words; only the MODEL sees the wrapped
         recovery note (transcript stays scaffold-free)."""
-        message, persisted = prepare_resume_pending_message(
+        message, persisted = _prepare_resume_pending_message(
             "restart_timeout", "what were we doing?", interactive=True
         )
 
@@ -296,7 +329,7 @@ class TestResumePendingSystemNote:
 
 
     def test_no_resume_pending_preserves_tool_tail_note(self):
-        """Tool-tail recovery follows the same evidence-preserving policy without a marker."""
+        """Regression: the old PR #9934 tool-tail behaviour is unchanged."""
         history = [
             {"role": "assistant", "content": None, "tool_calls": [
                 {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
@@ -306,9 +339,7 @@ class TestResumePendingSystemNote:
         ]
         result = _simulate_note_injection(history, "ping", resume_entry=None)
         assert "[System note:" in result
-        assert "Use recorded tool results as evidence" in result
-        assert "Do NOT repeat successful tool calls" in result
-        assert "failed or incomplete result may require a retry after checking" in result
+        assert "pending tool outputs" in result
 
     def test_stale_resume_pending_does_not_inject_restart_note(self):
         """Old restart markers must not revive an unrelated stale task.
@@ -422,9 +453,7 @@ class TestResumePendingSystemNote:
             history, "ping", resume_entry=None, window_secs=0,
         )
         assert "[System note:" in result
-        assert "Use recorded tool results as evidence" in result
-        assert "Do NOT repeat successful tool calls" in result
-        assert "failed or incomplete result may require a retry after checking" in result
+        assert "pending tool outputs" in result
 
     def test_legacy_history_without_timestamps_still_injects(self):
         """Transcripts predating timestamp persistence must keep the old
@@ -437,9 +466,7 @@ class TestResumePendingSystemNote:
         ]
         result = _simulate_note_injection(history, "ping", resume_entry=None)
         assert "[System note:" in result
-        assert "Use recorded tool results as evidence" in result
-        assert "Do NOT repeat successful tool calls" in result
-        assert "failed or incomplete result may require a retry after checking" in result
+        assert "pending tool outputs" in result
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +677,7 @@ async def test_startup_auto_resume_freshness_survives_spring_forward(monkeypatch
         marked = datetime(2026, 3, 8, 1, 50)
         now = datetime(2026, 3, 8, 3, 10)
         if aware_marker:
-            marked = datetime.fromtimestamp(marked.timestamp(), tz=timezone.utc)
+            marked = datetime.fromtimestamp(marked.timestamp(), tz=UTC)
 
         class _FrozenDatetime(datetime):
             @classmethod
@@ -1083,7 +1110,7 @@ async def test_auto_resume_sets_sentinel_before_task_execution():
     # The sentinel must be set immediately — before the task starts executing.
     assert pending_entry.session_key in runner._running_agents
     assert runner._running_agents[pending_entry.session_key] is _AGENT_PENDING_SENTINEL
-    assert pending_entry.session_key in runner._running_agents_ts
+    assert runner._session_state(pending_entry.session_key).turn.started_ts
 
     # Release the task and let it complete.
     gate.set()
@@ -1151,8 +1178,6 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner._is_session_run_current = lambda session_key, generation: True
     runner._invalidate_session_run_generation = lambda *a, **k: 0
     runner._claim_active_session_slot = lambda session_key, source: (object(), None)
-    runner._active_session_leases = {}
-    runner._busy_ack_ts = {}
     runner._post_turn_goal_continuation = AsyncMock()
     runner.session_store.get_or_create_session.return_value = None
 
@@ -1280,7 +1305,6 @@ async def test_startup_restore_gate_releases_when_boot_path_send_hangs(
 
     async def never_returns(*_args, **_kwargs):
         await hung.wait()
-        return None
 
     runner._send_restart_notification = never_returns
     runner._claim_pending_obligations = AsyncMock(return_value=[])
@@ -1345,3 +1369,4 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
+

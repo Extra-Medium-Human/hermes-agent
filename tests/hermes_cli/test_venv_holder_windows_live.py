@@ -94,7 +94,7 @@ class TestDetection:
         lives in the checkout's ``.venv``, which ``project_venv_dir`` resolves since
         7a94b1fbf77, so a ``sys.executable`` child IS a venv holder by design. The base
         interpreter the venv was created from is the foreign python."""
-
+        
         from hermes_constants import project_venv_dir
 
         base = getattr(sys, "_base_executable", None) or sys.executable
@@ -185,6 +185,7 @@ class TestAncestorExclusion:
             text=True,
             cwd=str(PROJECT_ROOT),
             timeout=120,
+            check=False,
         )
         import json
 

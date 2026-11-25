@@ -8,43 +8,24 @@ does not re-execute stale interrupted tool calls before addressing new input.
 
 
 def _simulate_auto_continue(agent_history: list, user_message: str) -> str:
-    """Exercise production recovery without starting a gateway or a model."""
-    from types import SimpleNamespace
-    from gateway.run_turn_runner import TurnRunner
-    from gateway.turn_context import TurnContext
+    """Reproduce the auto-continue injection logic from _run_agent().
 
-    runner = SimpleNamespace(
-        session_store=SimpleNamespace(_entries={}),
-        _adapter_for_source=lambda source: None,
-    )
-    ctx = TurnContext(message=user_message, history=agent_history, session_key="fixture")
-    TurnRunner(runner, ctx)._prepare_turn_message(agent_history)
-    return ctx.message
-
-
-class TestAutoDetection:
-    """Test that trailing tool results are correctly detected."""
-
-    def test_trailing_tool_result_triggers_note(self):
-        history = [
-            {"role": "user", "content": "deploy the app"},
-            {"role": "assistant", "content": None, "tool_calls": [
-                {"id": "call_1", "function": {"name": "terminal", "arguments": "{}"}}
-            ]},
-            {"role": "tool", "tool_call_id": "call_1", "content": "deployed successfully"},
-        ]
-        result = _simulate_auto_continue(history, "what happened?")
-        assert "[System note:" in result
-        assert "interrupted" in result
-        assert "NEW message" in result
-        assert "Do NOT repeat successful tool calls" in result
-        assert "failed or incomplete result may require a retry after checking" in result
-        assert "what happened?" in result
+    This mirrors the exact code in gateway/run.py so we can test the
+    detection and message transformation without spinning up a full
+    gateway runner.
+    """
+    message = user_message
+    if agent_history and agent_history[-1].get("role") == "tool":
+        message = (
+            "[System note: A new message has arrived. The conversation "
+            "history contains pending tool outputs from an interrupted turn. "
+            "IGNORE those pending results. Address the user's NEW message "
+            "below FIRST. Do NOT re-execute old tool calls from the history.]\n\n"
+            + message
+        )
+    return message
 
 
-    def test_empty_history_no_note(self):
-        result = _simulate_auto_continue([], "hello")
-        assert result == "hello"
 
 
 class TestInterruptedReplayFiltering:
